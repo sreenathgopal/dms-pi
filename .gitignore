@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+*.o
+*.exe
+*.dll
+*.so
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+compile_commands.json
+
+# Claude
+.claude/
+
+# Downloaded models (large binaries — download with models/download_models.sh)
+models/face_detection_yunet.onnx
+models/face_landmark.tflite
+
+# OS
+.DS_Store
+Thumbs.db

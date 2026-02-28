@@ -1,0 +1,31 @@
+[Unit]
+Description=Driver Monitoring System (C++)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /tmp/dms /tmp/dms_images
+ExecStart=/opt/dms/bin/dms
+WorkingDirectory=/opt/dms
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dms
+
+# Memory limit (C++ version uses ~60-80MB vs Python's ~270MB)
+MemoryMax=200M
+MemoryHigh=150M
+
+# Security
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dms /tmp/dms /tmp/dms_images /dev
+PrivateTmp=false
+NoNewPrivileges=false
+
+# GPIO + camera access
+SupplementaryGroups=gpio video i2c dialout
+
+[Install]
+WantedBy=multi-user.target
