@@ -12,7 +12,8 @@ struct FaceBox {
     float confidence;
 };
 
-// YuNet-based face detector using OpenCV's cv::FaceDetectorYN
+// Face detector: tries YuNet first, falls back to Haar cascade if YuNet
+// fails (e.g. OpenCV 4.6 ONNX incompatibility).
 class FaceDetector {
 public:
     explicit FaceDetector(const std::string& model_path,
@@ -26,8 +27,12 @@ public:
     // Update input size (if frame resolution changes)
     void set_input_size(int w, int h);
 
+    bool using_haar() const { return use_haar_; }
+
 private:
     cv::Ptr<cv::FaceDetectorYN> detector_;
+    cv::CascadeClassifier haar_;
+    bool use_haar_ = false;
     float threshold_;
 };
 
