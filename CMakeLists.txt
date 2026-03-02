@@ -77,7 +77,10 @@ target_link_libraries(dms PRIVATE
 target_link_libraries(dms PRIVATE pthread dl)
 
 if(TFLITE_LIB)
-    target_link_libraries(dms PRIVATE ${TFLITE_LIB} ${TFLITE_DEP_LIBS})
+    target_link_libraries(dms PRIVATE
+        -Wl,--allow-multiple-definition
+        ${TFLITE_LIB} ${TFLITE_DEP_LIBS}
+    )
 endif()
 
 if(GPIOD_FOUND)
