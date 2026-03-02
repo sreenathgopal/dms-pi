@@ -20,6 +20,7 @@ mkdir -p /opt/dms/models
 # Copy models to /opt/dms/models (detection pipeline expects them there)
 cp -v "$PROJECT_DIR/models/"*.tflite /opt/dms/models/ 2>/dev/null || true
 cp -v "$PROJECT_DIR/models/"*.onnx /opt/dms/models/ 2>/dev/null || true
+chmod 644 /opt/dms/models/*
 
 # Detect boot partition (Bookworm uses /boot/firmware, older uses /boot)
 if [ -d /boot/firmware ]; then
@@ -54,6 +55,9 @@ systemctl enable dms
 # Disable old services if they exist
 systemctl disable video_recorder 2>/dev/null || true
 systemctl disable dms_optimized 2>/dev/null || true
+systemctl disable dms-recorder 2>/dev/null || true
+systemctl disable dms-detector 2>/dev/null || true
+systemctl mask dms-recorder dms-detector 2>/dev/null || true
 
 echo "=== Deploy complete ==="
 echo "Start: sudo systemctl start dms"
