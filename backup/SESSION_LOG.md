@@ -1,8 +1,8 @@
-# DMS Pi — Session Log (2026-03-01)
+# DMS Pi — Session Log (2026-03-01 to 2026-03-02)
 
 ## Overview
 
-This session focused on getting both apps (video_recorder + DMS) running together on the Pi Zero 2W, diagnosing a critical CPU bottleneck that limited DMS to 1.5 FPS, and restructuring the video recorder to achieve **10.6 FPS** — a **7x improvement**.
+This session focused on getting both apps (video_recorder + DMS) running together on the Pi Zero 2W, diagnosing a critical CPU bottleneck that limited DMS to 1.5 FPS, and restructuring the video recorder to achieve **10.6 FPS** — a **7x improvement**. Session 2 added continuous MJPEG recording, disk cleanup, memory management, and systemd auto-start.
 
 ---
 
@@ -764,9 +764,177 @@ All systems operational:
 
 ---
 
+## Continuous Recording (MJPEG copy-mux via tee)
+
+### Approaches Evaluated
+
+| Approach | CPU | File Size | Disk (44GB) | DMS works? | Result |
+|---|---|---|---|---|---|
+| rpicam-vid H.264 `--segment` (native) | ~0% | 5.7MB/min | ~130 hours | No (single output) | Can't split |
+| ffmpeg H.264 re-encode from MJPEG | ~130% | 5.7MB/min | ~130 hours | Yes | Kills CPU |
+| **ffmpeg MJPEG `-c:v copy` (chosen)** | **~0%** | **6.2MB/min** | **~5 days** | **Yes** | **Works** |
+
+**Why not H.264?** rpicam-vid only has one `-o` output. It can either pipe MJPEG to the DMS pipeline OR write H.264 segments to disk, but not both simultaneously. The hardware H.264 encoder (`h264_v4l2m2m`) needs raw YUV420 input — decoding MJPEG to YUV on the Pi Zero 2W costs ~130% CPU, defeating the purpose.
+
+**Chosen approach:** ffmpeg with `-c:v copy` just wraps the raw JPEG bytes from `tee` into an AVI container — no decoding, no encoding, near-zero CPU.
+
+### Updated Pipeline Architecture
+
+```
+rpicam-vid (MJPEG, 640x480@10fps, hardware encode)
+    │
+    │  stdout pipe
+    │
+    └──→ tee ──→ ffmpeg -c:v copy (mux MJPEG → 5-min AVI segments, ~0% CPU)
+            │         └──→ /home/test/recordings/rec_YYYYMMDD_HHMMSS.avi
+            │
+            └──→ video_recorder --stdin --headless (DMS pipeline, unchanged)
+                      ├── Store raw JPEG in ring buffer
+                      ├── Publish frames via ZMQ :5556
+                      └── Save alert clips on ZMQ :5555 trigger
+```
+
+### Updated Service: `dms-recorder.service`
+
+```ini
+[Unit]
+Description=DMS Video Recorder (rpicam-vid + ZMQ publisher + continuous recording)
+After=network.target
+Before=dms-detector.service
+
+[Service]
+Type=simple
+User=test
+WorkingDirectory=/home/test/video_recorder
+ExecStartPre=/bin/mkdir -p /home/test/recordings
+ExecStart=/bin/bash -c 'rpicam-vid -t 0 --width 640 --height 480 --framerate 10 --codec mjpeg --nopreview --flush -o - 2>/dev/null | tee >(ffmpeg -y -f mjpeg -probesize 100000 -framerate 10 -i pipe:0 -c:v copy -f segment -segment_time 300 -reset_timestamps 1 -strftime 1 /home/test/recordings/rec_%%Y%%m%%d_%%H%%M%%S.avi > /tmp/ffmpeg.log 2>&1) | stdbuf -oL /home/test/video_recorder/build/video_recorder --stdin --headless'
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/home/test
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Key ffmpeg flags:**
+- `-c:v copy` — no re-encoding, just muxes raw JPEG into AVI container
+- `-f segment -segment_time 300` — creates new file every 5 minutes
+- `-strftime 1` — timestamp-based filenames
+- `-probesize 100000` — small probe so ffmpeg starts quickly from pipe
+
+### CPU Usage (with continuous recording)
+
+| Process | CPU | Notes |
+|---|---|---|
+| rpicam-vid | ~22% | Camera + MJPEG hardware encode |
+| ffmpeg `-c:v copy` | ~0% | Just muxing bytes |
+| video_recorder | (in rpicam group) | ZMQ publish + ring buffer |
+| DMS (python3) | ~83% | 10.6 FPS, face detection + landmarks |
+| **System idle** | **~50%** | Unchanged from before recording |
+
+### Disk Cleanup
+
+**Script:** `/usr/local/bin/dms-disk-cleanup.sh`
+
+```bash
+#!/bin/bash
+# DMS Disk Cleanup — runs every hour via cron
+# Deletes oldest recordings when disk usage > 80%
+
+REC_DIR=/home/test/recordings
+ALERT_DIR=/home/test/video_recorder/alerts
+LOG=/tmp/dms-watchdog.log
+DATE=$(date '+%Y-%m-%d %H:%M:%S')
+DISK_PCT=$(df /home/test --output=pcent | tail -1 | tr -d ' %')
+
+if [ "$DISK_PCT" -gt 80 ]; then
+    COUNT=$(ls -1 $REC_DIR/*.avi 2>/dev/null | wc -l)
+    # Delete oldest recordings, keep last 12 (= 1 hour of 5-min segments)
+    ls -1t $REC_DIR/*.avi 2>/dev/null | tail -n +13 | xargs rm -f 2>/dev/null
+    DELETED=$(($COUNT - $(ls -1 $REC_DIR/*.avi 2>/dev/null | wc -l)))
+    echo "[$DATE] CLEANUP: Disk ${DISK_PCT}% — deleted ${DELETED} old recordings" >> $LOG
+fi
+
+# Delete alert clips older than 7 days
+find $ALERT_DIR -name '*.avi' -mtime +7 -delete 2>/dev/null
+```
+
+**Cron (root):**
+```
+*/5 * * * * /usr/local/bin/dms-watchdog.sh
+0 * * * * /usr/local/bin/dms-disk-cleanup.sh
+```
+
+### Recording Storage Estimate
+- File size: ~6.2MB/min = ~370MB/hour
+- 44GB available disk: ~5 days continuous
+- Cleanup triggers at 80% disk (35GB), keeps last 1 hour of recordings
+
+---
+
+## Software Installed on Pi
+
+### System Packages (apt)
+
+| Package | Purpose | Installed by |
+|---|---|---|
+| `build-essential` | C++ compiler (gcc/g++) | Pre-existing |
+| `cmake` | Build system for video_recorder | Pre-existing |
+| `git` | Version control | Pre-existing |
+| `screen` | Terminal multiplexer for debugging | Pre-existing |
+| `htop` | Interactive process viewer | Pre-existing |
+| `ncdu` | Disk usage analyzer | Pre-existing |
+| `libopencv-dev` | OpenCV C++ (face detection, image processing) | Pre-existing |
+| `libzmq3-dev` | ZeroMQ C++ (inter-process communication) | Pre-existing |
+| `libcurl4-openssl-dev` | HTTP client library | Pre-existing |
+| `libsqlite3-dev` | SQLite database | Pre-existing |
+| `libgpiod-dev` | GPIO control (buzzer/LED) | Pre-existing |
+| `libmicrohttpd-dev` | HTTP server for management API | Pre-existing |
+| `rpicam-apps-lite` | rpicam-vid camera tool (libcamera) | Pre-existing |
+| `v4l-utils` | Video4Linux utilities | Pre-existing |
+| `gpiod` | GPIO daemon | Pre-existing |
+| `ffmpeg` | Video muxing for continuous recording | **Installed this session** |
+| `earlyoom` | Early OOM daemon (memory protection) | **Installed this session** |
+| `mkvtoolnix` | Video container tools | Pre-existing |
+| `tailscale` | VPN/remote access | Pre-existing |
+
+### Python Packages (pip)
+
+| Package | Version | Purpose |
+|---|---|---|
+| `opencv-python` | 4.8.1.78 | Face detection (YuNet) |
+| `numpy` | 1.24.2 | Array operations |
+| `tflite-runtime` | 2.14.0 | TFLite landmark inference |
+| `ai-edge-litert` | 2.1.2 | Edge AI runtime |
+| `pyzmq` | 27.1.0 | ZeroMQ Python bindings |
+| `psutil` | 7.2.2 | System monitoring |
+| `protobuf` | 7.34.0 | Protocol buffers (TFLite) |
+| `flatbuffers` | 20181003210633 | TFLite model format |
+| `requests` | 2.28.1 | HTTP client |
+| `gpiozero` | 2.0.1 | GPIO Python interface |
+| `python3-libgpiod` | (system) | GPIO daemon bindings |
+
+### Custom Files on Pi
+
+| File | Purpose |
+|---|---|
+| `/etc/systemd/system/dms-recorder.service` | Recorder auto-start service |
+| `/etc/systemd/system/dms-detector.service` | DMS detector auto-start service |
+| `/etc/systemd/system/dms-recorder.service.d/memory.conf` | Recorder memory limits (80M/100M) |
+| `/etc/systemd/system/dms-detector.service.d/memory.conf` | Detector memory limits (150M/180M) |
+| `/usr/local/bin/dms-watchdog.sh` | Service + memory watchdog (every 5 min) |
+| `/usr/local/bin/dms-disk-cleanup.sh` | Disk cleanup (every hour) |
+| `/etc/default/earlyoom` | earlyoom config (protect DMS processes) |
+| `/etc/sysctl.d/99-dms.conf` | Kernel tuning (swappiness, cache pressure) |
+| `/home/test/recordings/` | Continuous MJPEG recording segments |
+| `/home/test/video_recorder/alerts/` | Alert clip output |
+
+---
+
 ## What's Next
 - Build and deploy the dms-pi C++ version (replaces Python DMS)
-- Add continuous H.264 recording via `tee` in the rpicam-vid pipeline
-- Consider higher resolution (1080p) with H.264 hardware encoding + tee split
+- Consider higher resolution (1080p) with H.264 hardware encoding
 - GPS hardware integration
 - Alert buzzer/LED via libgpiod
