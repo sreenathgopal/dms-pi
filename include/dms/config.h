@@ -6,11 +6,10 @@
 namespace dms {
 
 struct Config {
-    // Camera
-    int cam_id = 0;
-    int frame_w = 320;
-    int frame_h = 240;
-    int fps = 15;
+    // Camera / capture
+    int frame_w = 640;
+    int frame_h = 480;
+    int fps = 10;
     int skip_frames = 2;
 
     // Facial detection thresholds (fallback when TFLite unavailable)
@@ -50,39 +49,17 @@ struct Config {
     int led_pin = 4;
     float buzzer_duration = 0.12f;
 
-    // Speed threshold (km/h)
-    int speed_threshold = 0;
+    // Ring buffer
+    int ring_buffer_seconds = 90;
 
-    // ZeroMQ endpoints (inproc for single-process C++)
-    std::string zmq_detection_endpoint = "inproc://detection";
-    std::string zmq_gps_endpoint = "inproc://gps";
+    // Recording / alerts
+    std::string recordings_dir = "/home/test/recordings";
+    std::string alerts_dir = "alerts";
+    int alert_pre_seconds = 10;
+    int alert_post_seconds = 90;
 
-    // API
-    std::string api_base_url = "https://carfleet.ethansolution.com";
-    std::string api_store_data = "https://carfleet.ethansolution.com/api/store-dc-data";
-    std::string api_upload_file = "https://carfleet.ethansolution.com/api/upload-file";
-    std::string api_create_device = "https://carfleet.ethansolution.com/api/auth/create-device";
-    std::string api_handshake = "https://carfleet.ethansolution.com/api/auth/handshake";
-
-    // Database
-    std::string db_path = "/var/lib/dms/dms.db";
-
-    // Images
-    std::string image_dir = "/tmp/dms_images";
-    int image_quality = 70;
-    int image_max_age = 300;
-    int image_max_count = 50;
-
-    // Timings
-    float api_send_interval = 1.0f;
-    float gps_store_interval = 1.0f;
-
-    // GPS serial
-    std::string gps_port = "/dev/ttyACM0";
-    int gps_baud = 9600;
-
-    // Management server
-    int mgmt_port = 8080;
+    // Web server
+    int web_port = 8080;
 
     // Logging
     std::string log_level = "INFO";

@@ -1,12 +1,16 @@
 #pragma once
 
-#include <zmq.hpp>
+#include <dms/app_state.h>
+#include <dms/ring_buffer.h>
 #include <atomic>
 
 namespace dms {
 
-// HTTP management server thread.
-// Provides health checks and JSON API on port 8080 via libmicrohttpd.
-void management_service(zmq::context_t& ctx, std::atomic<bool>& shutdown);
+// Start the libmicrohttpd web server (non-blocking — uses internal polling thread).
+void start_web_server(int port, AppState& state, RingBuffer& ring_buf,
+                       std::atomic<bool>& shutdown);
+
+// Stop the web server.
+void stop_web_server();
 
 } // namespace dms

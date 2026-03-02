@@ -1,12 +1,17 @@
 #pragma once
 
-#include <zmq.hpp>
-#include <atomic>
-
 namespace dms {
 
-// GPIO alert thread.
-// Subscribes to detection.status, drives buzzer + LED via libgpiod.
-void alert_service(zmq::context_t& ctx, std::atomic<bool>& shutdown);
+// GPIO utility functions for buzzer + LED.
+// Call gpio_init() once at startup, gpio_cleanup() at shutdown.
+
+void gpio_init();
+void gpio_cleanup();
+
+// Non-blocking buzz (spawns a short detached thread)
+void gpio_buzz(float duration_sec);
+
+// LED on/off
+void gpio_led(bool on);
 
 } // namespace dms

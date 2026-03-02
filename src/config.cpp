@@ -44,7 +44,6 @@ void load_config(Config& cfg, const std::string& path) {
                 if (j.contains(k) && j[k].is_boolean()) v = j[k].get<bool>();
             };
 
-            get_int("cam_id", cfg.cam_id);
             get_int("frame_w", cfg.frame_w);
             get_int("frame_h", cfg.frame_h);
             get_int("fps", cfg.fps);
@@ -69,24 +68,12 @@ void load_config(Config& cfg, const std::string& path) {
             get_int("buzzer_pin_2", cfg.buzzer_pin_2);
             get_int("led_pin", cfg.led_pin);
             get_float("buzzer_duration", cfg.buzzer_duration);
-            get_int("speed_threshold", cfg.speed_threshold);
-            get_str("zmq_detection_endpoint", cfg.zmq_detection_endpoint);
-            get_str("zmq_gps_endpoint", cfg.zmq_gps_endpoint);
-            get_str("api_base_url", cfg.api_base_url);
-            get_str("api_store_data", cfg.api_store_data);
-            get_str("api_upload_file", cfg.api_upload_file);
-            get_str("api_create_device", cfg.api_create_device);
-            get_str("api_handshake", cfg.api_handshake);
-            get_str("db_path", cfg.db_path);
-            get_str("image_dir", cfg.image_dir);
-            get_int("image_quality", cfg.image_quality);
-            get_int("image_max_age", cfg.image_max_age);
-            get_int("image_max_count", cfg.image_max_count);
-            get_float("api_send_interval", cfg.api_send_interval);
-            get_float("gps_store_interval", cfg.gps_store_interval);
-            get_str("gps_port", cfg.gps_port);
-            get_int("gps_baud", cfg.gps_baud);
-            get_int("mgmt_port", cfg.mgmt_port);
+            get_int("ring_buffer_seconds", cfg.ring_buffer_seconds);
+            get_str("recordings_dir", cfg.recordings_dir);
+            get_str("alerts_dir", cfg.alerts_dir);
+            get_int("alert_pre_seconds", cfg.alert_pre_seconds);
+            get_int("alert_post_seconds", cfg.alert_post_seconds);
+            get_int("web_port", cfg.web_port);
             get_str("log_level", cfg.log_level);
         } catch (const std::exception& e) {
             std::cerr << "[config] Warning: failed to parse " << path << ": " << e.what() << std::endl;
@@ -114,7 +101,6 @@ void load_config(Config& cfg, const std::string& path) {
         }
     };
 
-    env_int("CAM_ID", cfg.cam_id);
     env_int("FRAME_W", cfg.frame_w);
     env_int("FRAME_H", cfg.frame_h);
     env_int("FPS", cfg.fps);
@@ -128,12 +114,10 @@ void load_config(Config& cfg, const std::string& path) {
     env_float("EYE_CLOSED_PROB", cfg.eye_closed_prob);
     env_float("YAWN_PROB", cfg.yawn_prob);
     env_float("EYES_CLOSED_DURATION", cfg.eyes_closed_duration);
-    env_int("SPEED_THRESHOLD", cfg.speed_threshold);
-    env_str("DB_PATH", cfg.db_path);
-    env_str("IMAGE_DIR", cfg.image_dir);
-    env_str("GPS_PORT", cfg.gps_port);
-    env_int("GPS_BAUD", cfg.gps_baud);
-    env_int("MGMT_PORT", cfg.mgmt_port);
+    env_int("RING_BUFFER_SECONDS", cfg.ring_buffer_seconds);
+    env_str("RECORDINGS_DIR", cfg.recordings_dir);
+    env_str("ALERTS_DIR", cfg.alerts_dir);
+    env_int("WEB_PORT", cfg.web_port);
     env_str("LOG_LEVEL", cfg.log_level);
 }
 

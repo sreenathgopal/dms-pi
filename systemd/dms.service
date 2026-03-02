@@ -1,31 +1,21 @@
 [Unit]
-Description=Driver Monitoring System (C++)
+Description=DMS Dash Cam (C++ unified binary)
 After=network.target
-Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/mkdir -p /tmp/dms /tmp/dms_images
-ExecStart=/opt/dms/bin/dms
-WorkingDirectory=/opt/dms
+User=test
+WorkingDirectory=/home/test/dms-pi
+ExecStartPre=/bin/mkdir -p /home/test/recordings
+ExecStartPre=/bin/mkdir -p /home/test/dms-pi/alerts
+ExecStart=/bin/bash -c 'rpicam-vid -t 0 --width 640 --height 480 --framerate 10 --codec mjpeg --nopreview --flush -o - 2>/dev/null | tee >(ffmpeg -y -f mjpeg -probesize 100000 -framerate 10 -i pipe:0 -c:v copy -f segment -segment_time 300 -reset_timestamps 1 -strftime 1 /home/test/recordings/rec_%%Y%%m%%d_%%H%%M%%S.avi > /tmp/ffmpeg.log 2>&1) | /home/test/dms-pi/build/dms --stdin --headless'
 Restart=always
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=dms
-
-# Memory limit (C++ version uses ~60-80MB vs Python's ~270MB)
-MemoryMax=200M
-MemoryHigh=150M
-
-# Security
-ProtectSystem=strict
-ReadWritePaths=/var/lib/dms /tmp/dms /tmp/dms_images /dev
-PrivateTmp=false
-NoNewPrivileges=false
+MemoryMax=120M
+MemoryHigh=100M
 
 # GPIO + camera access
-SupplementaryGroups=gpio video i2c dialout
+SupplementaryGroups=gpio video i2c
 
 [Install]
 WantedBy=multi-user.target

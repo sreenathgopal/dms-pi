@@ -2,9 +2,7 @@
 #include <dms/config.h>
 
 #include <microhttpd.h>
-#include <sqlite3.h>
 #include <nlohmann/json.hpp>
-#include <curl/curl.h>
 
 #include <iostream>
 #include <string>
@@ -13,53 +11,42 @@
 #include <ctime>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
+#include <vector>
 
-#include <thread>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 namespace dms {
 
 using json = nlohmann::json;
 
-static time_t g_start_time = 0;
+// Global pointers set by start_web_server()
+static AppState* g_state = nullptr;
+static RingBuffer* g_ring = nullptr;
+static std::atomic<bool>* g_shutdown = nullptr;
+static struct MHD_Daemon* g_daemon = nullptr;
 
-// Forward-declare post_json for create_device / handshake
-static size_t write_cb_mgmt(void* ptr, size_t size, size_t nmemb, std::string* data) {
-    data->append(static_cast<char*>(ptr), size * nmemb);
-    return size * nmemb;
-}
-
-static json mgmt_post_json(const std::string& url, const json& payload, int timeout_sec = 15) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return json();
-
-    std::string body = payload.dump();
-    std::string response;
-
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, body.size());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb_mgmt);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
-
-    CURLcode res = curl_easy_perform(curl);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK) return json();
-    try { return json::parse(response); } catch (...) { return json(); }
-}
-
-// --- Helper to send JSON response ---
+// --- Helper: send JSON response ---
 static MHD_Result send_json(struct MHD_Connection* conn, int status_code, const json& data) {
     std::string body = data.dump();
     struct MHD_Response* response = MHD_create_response_from_buffer(
         body.size(), (void*)body.c_str(), MHD_RESPMEM_MUST_COPY);
     MHD_add_response_header(response, "Content-Type", "application/json");
+    MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+    MHD_Result ret = MHD_queue_response(conn, status_code, response);
+    MHD_destroy_response(response);
+    return ret;
+}
+
+// --- Helper: send plain text ---
+static MHD_Result send_text(struct MHD_Connection* conn, int status_code, const std::string& text) {
+    struct MHD_Response* response = MHD_create_response_from_buffer(
+        text.size(), (void*)text.c_str(), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(response, "Content-Type", "text/plain");
     MHD_Result ret = MHD_queue_response(conn, status_code, response);
     MHD_destroy_response(response);
     return ret;
@@ -86,231 +73,334 @@ static json get_memory() {
     return mem;
 }
 
-// --- Read POST body ---
+// --- Get disk usage ---
+static json get_disk_usage(const std::string& path) {
+    struct statvfs st;
+    if (statvfs(path.c_str(), &st) == 0) {
+        long total_mb = (long)(st.f_blocks * st.f_frsize) / (1024 * 1024);
+        long free_mb = (long)(st.f_bfree * st.f_frsize) / (1024 * 1024);
+        return {{"total_mb", total_mb}, {"free_mb", free_mb}, {"used_mb", total_mb - free_mb}};
+    }
+    return {};
+}
+
+// --- List files in a directory (*.avi) ---
+static json list_files(const std::string& dir) {
+    json files = json::array();
+    DIR* d = opendir(dir.c_str());
+    if (!d) return files;
+
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.size() < 5) continue;
+        // Accept .avi and .jpg files
+        std::string ext = name.substr(name.size() - 4);
+        if (ext != ".avi" && ext != ".jpg") continue;
+
+        std::string full_path = dir + "/" + name;
+        struct stat st;
+        if (stat(full_path.c_str(), &st) == 0) {
+            files.push_back({
+                {"name", name},
+                {"size", st.st_size},
+                {"mtime", static_cast<long>(st.st_mtime)}
+            });
+        }
+    }
+    closedir(d);
+
+    // Sort by mtime descending (newest first)
+    std::sort(files.begin(), files.end(), [](const json& a, const json& b) {
+        return a["mtime"].get<long>() > b["mtime"].get<long>();
+    });
+    return files;
+}
+
+// --- Validate filename (prevent path traversal) ---
+static bool valid_filename(const std::string& name) {
+    if (name.empty() || name.find("..") != std::string::npos || name.find('/') != std::string::npos) {
+        return false;
+    }
+    std::string ext = name.substr(name.size() >= 4 ? name.size() - 4 : 0);
+    return (ext == ".avi" || ext == ".jpg");
+}
+
+// --- POST body accumulation ---
 struct PostData {
     std::string body;
 };
 
 // --- Route handlers ---
 
-static MHD_Result handle_health(struct MHD_Connection* conn) {
-    return send_json(conn, MHD_HTTP_OK, {{"status", "ok"}});
-}
-
 static MHD_Result handle_status(struct MHD_Connection* conn) {
     const auto& cfg = config();
-    json resp = {
-        {"uptime_seconds", static_cast<int>(time(nullptr) - g_start_time)},
-        {"memory", get_memory()},
-        {"architecture", "cpp-zmq-threads"},
-        {"config", {
-            {"resolution", std::to_string(cfg.frame_w) + "x" + std::to_string(cfg.frame_h)},
-            {"skip_frames", cfg.skip_frames},
-            {"speed_threshold", cfg.speed_threshold},
-            {"tflite_enabled", cfg.use_tflite},
-            {"zmq_detection", cfg.zmq_detection_endpoint},
-            {"zmq_gps", cfg.zmq_gps_endpoint}
-        }}
+    json status_data;
+    {
+        std::lock_guard<std::mutex> lock(g_state->mtx);
+        status_data = {
+            {"status", g_state->detection_status},
+            {"ear_l", g_state->ear_l},
+            {"ear_r", g_state->ear_r},
+            {"mar", g_state->mar},
+            {"detection_fps", g_state->detection_fps},
+            {"sleep_alerts", g_state->sleep_alerts},
+            {"yawn_alerts", g_state->yawn_alerts},
+            {"uptime_seconds", static_cast<int>(time(nullptr) - g_state->start_time)},
+        };
+    }
+    status_data["ring_buffer_frames"] = static_cast<int>(g_ring->size());
+    status_data["ring_buffer_total"] = g_ring->total_frames();
+    status_data["memory"] = get_memory();
+    status_data["disk"] = get_disk_usage(cfg.recordings_dir);
+    status_data["config"] = {
+        {"resolution", std::to_string(cfg.frame_w) + "x" + std::to_string(cfg.frame_h)},
+        {"fps", cfg.fps},
+        {"skip_frames", cfg.skip_frames},
+        {"tflite_enabled", cfg.use_tflite}
     };
-    return send_json(conn, MHD_HTTP_OK, resp);
+    return send_json(conn, MHD_HTTP_OK, status_data);
 }
 
-static MHD_Result handle_devices(struct MHD_Connection* conn) {
+static MHD_Result handle_recordings(struct MHD_Connection* conn) {
     const auto& cfg = config();
-    sqlite3* db = nullptr;
-    std::string device_id;
-    if (sqlite3_open_v2(cfg.db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
-        sqlite3_stmt* stmt;
-        if (sqlite3_prepare_v2(db, "SELECT device_id FROM device LIMIT 1", -1, &stmt, nullptr) == SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                const char* val = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-                if (val) device_id = val;
-            }
-            sqlite3_finalize(stmt);
-        }
-        sqlite3_close(db);
-    }
-    return send_json(conn, MHD_HTTP_OK, {{"device_id", device_id}});
+    return send_json(conn, MHD_HTTP_OK, list_files(cfg.recordings_dir));
 }
 
-static MHD_Result handle_users(struct MHD_Connection* conn) {
+static MHD_Result handle_alerts(struct MHD_Connection* conn) {
     const auto& cfg = config();
-    json user_data = json::object();
-    sqlite3* db = nullptr;
-    if (sqlite3_open_v2(cfg.db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
-        sqlite3_stmt* stmt;
-        if (sqlite3_prepare_v2(db, "SELECT * FROM user_info LIMIT 1", -1, &stmt, nullptr) == SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                int cols = sqlite3_column_count(stmt);
-                for (int i = 0; i < cols; i++) {
-                    const char* name = sqlite3_column_name(stmt, i);
-                    const char* val = reinterpret_cast<const char*>(sqlite3_column_text(stmt, i));
-                    if (name && val) user_data[name] = val;
-                }
-            }
-            sqlite3_finalize(stmt);
-        }
-        sqlite3_close(db);
-    }
-    return send_json(conn, MHD_HTTP_OK, user_data);
+    return send_json(conn, MHD_HTTP_OK, list_files(cfg.alerts_dir));
 }
 
-static MHD_Result handle_get_config(struct MHD_Connection* conn) {
+static MHD_Result handle_download(struct MHD_Connection* conn) {
+    const char* f_param = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "f");
+    if (!f_param || !valid_filename(f_param)) {
+        return send_json(conn, MHD_HTTP_BAD_REQUEST, {{"error", "invalid filename"}});
+    }
+
+    const auto& cfg = config();
+    std::string filename(f_param);
+
+    // Search in recordings and alerts directories
+    std::string full_path;
+    std::string try_rec = cfg.recordings_dir + "/" + filename;
+    std::string try_alert = cfg.alerts_dir + "/" + filename;
+
+    struct stat st;
+    if (stat(try_rec.c_str(), &st) == 0) {
+        full_path = try_rec;
+    } else if (stat(try_alert.c_str(), &st) == 0) {
+        full_path = try_alert;
+    } else {
+        return send_json(conn, MHD_HTTP_NOT_FOUND, {{"error", "file not found"}});
+    }
+
+    // Open file
+    int fd = open(full_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return send_json(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, {{"error", "cannot open file"}});
+    }
+
+    // Use MHD's file response with Range support
+    struct MHD_Response* response = MHD_create_response_from_fd_at_offset64(
+        st.st_size, fd, 0);
+
+    // Content-Type based on extension
+    if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".jpg") {
+        MHD_add_response_header(response, "Content-Type", "image/jpeg");
+    } else {
+        MHD_add_response_header(response, "Content-Type", "video/x-msvideo");
+    }
+    MHD_add_response_header(response, "Accept-Ranges", "bytes");
+    MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+
+    // Check for Range header
+    const char* range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
+    int status_code = MHD_HTTP_OK;
+    if (range) {
+        // Parse "bytes=START-END"
+        long long start = 0, end = st.st_size - 1;
+        if (sscanf(range, "bytes=%lld-%lld", &start, &end) >= 1) {
+            if (end >= st.st_size) end = st.st_size - 1;
+            // Recreate response with offset
+            MHD_destroy_response(response);
+            close(fd);
+            fd = open(full_path.c_str(), O_RDONLY);
+            if (fd < 0) {
+                return send_json(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, {{"error", "cannot reopen file"}});
+            }
+            long long length = end - start + 1;
+            response = MHD_create_response_from_fd_at_offset64(length, fd, start);
+
+            char content_range[128];
+            snprintf(content_range, sizeof(content_range), "bytes %lld-%lld/%lld",
+                     start, end, (long long)st.st_size);
+            MHD_add_response_header(response, "Content-Range", content_range);
+            MHD_add_response_header(response, "Accept-Ranges", "bytes");
+            MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+            if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".jpg") {
+                MHD_add_response_header(response, "Content-Type", "image/jpeg");
+            } else {
+                MHD_add_response_header(response, "Content-Type", "video/x-msvideo");
+            }
+            status_code = MHD_HTTP_PARTIAL_CONTENT;
+        }
+    }
+
+    MHD_Result ret = MHD_queue_response(conn, status_code, response);
+    MHD_destroy_response(response);
+    return ret;
+}
+
+static MHD_Result handle_delete(struct MHD_Connection* conn) {
+    const char* f_param = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "f");
+    if (!f_param || !valid_filename(f_param)) {
+        return send_json(conn, MHD_HTTP_BAD_REQUEST, {{"error", "invalid filename"}});
+    }
+
+    const auto& cfg = config();
+    std::string filename(f_param);
+
+    // Search in recordings and alerts
+    std::string try_rec = cfg.recordings_dir + "/" + filename;
+    std::string try_alert = cfg.alerts_dir + "/" + filename;
+
+    if (unlink(try_rec.c_str()) == 0 || unlink(try_alert.c_str()) == 0) {
+        return send_json(conn, MHD_HTTP_OK, {{"deleted", filename}});
+    }
+    return send_json(conn, MHD_HTTP_NOT_FOUND, {{"error", "file not found"}});
+}
+
+static MHD_Result handle_config_get(struct MHD_Connection* conn) {
     const auto& cfg = config();
     json resp = {
-        {"cam_id", cfg.cam_id},
         {"frame_w", cfg.frame_w},
         {"frame_h", cfg.frame_h},
         {"fps", cfg.fps},
         {"skip_frames", cfg.skip_frames},
         {"use_tflite", cfg.use_tflite},
-        {"speed_threshold", cfg.speed_threshold},
         {"eyes_closed_duration", cfg.eyes_closed_duration},
         {"eye_closed_prob", cfg.eye_closed_prob},
         {"yawn_prob", cfg.yawn_prob},
         {"buzzer_pin_1", cfg.buzzer_pin_1},
         {"buzzer_pin_2", cfg.buzzer_pin_2},
         {"led_pin", cfg.led_pin},
-        {"mgmt_port", cfg.mgmt_port},
-        {"db_path", cfg.db_path},
-        {"gps_port", cfg.gps_port}
+        {"ring_buffer_seconds", cfg.ring_buffer_seconds},
+        {"recordings_dir", cfg.recordings_dir},
+        {"alerts_dir", cfg.alerts_dir},
+        {"web_port", cfg.web_port}
     };
     return send_json(conn, MHD_HTTP_OK, resp);
 }
 
-static MHD_Result handle_create_device(struct MHD_Connection* conn) {
-    const auto& cfg = config();
-    json payload = {
-        {"device_type", "DC"},
-        {"admin_id", "admin@admin.com"},
-        {"admin_pass", "12345678"}
-    };
-
-    auto result = mgmt_post_json(cfg.api_create_device, payload);
-    if (result.is_null() || !result.value("success", false)) {
-        return send_json(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, {{"error", "API returned no device_id"}});
-    }
-
-    std::string dev_id = result["data"]["device_id"].get<std::string>();
-
-    // Save to DB
-    sqlite3* db = nullptr;
-    if (sqlite3_open(cfg.db_path.c_str(), &db) == SQLITE_OK) {
-        sqlite3_stmt* stmt;
-        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO device (device_id) VALUES (?)", -1, &stmt, nullptr);
-        sqlite3_bind_text(stmt, 1, dev_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-
-        sqlite3_prepare_v2(db,
-            "INSERT INTO configure (config_key, config_value) VALUES ('speed', '0') "
-            "ON CONFLICT(config_key) DO UPDATE SET config_value='0'", -1, &stmt, nullptr);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        sqlite3_close(db);
-    }
-
-    return send_json(conn, MHD_HTTP_OK, {{"device_id", dev_id}});
-}
-
-static MHD_Result handle_handshake(struct MHD_Connection* conn) {
-    const auto& cfg = config();
-
-    // Get device_id from DB
-    std::string device_id;
-    sqlite3* db = nullptr;
-    if (sqlite3_open_v2(cfg.db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
-        sqlite3_stmt* stmt;
-        if (sqlite3_prepare_v2(db, "SELECT device_id FROM device LIMIT 1", -1, &stmt, nullptr) == SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                const char* val = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-                if (val) device_id = val;
-            }
-            sqlite3_finalize(stmt);
-        }
-        sqlite3_close(db);
-    }
-
-    if (device_id.empty()) {
-        return send_json(conn, MHD_HTTP_BAD_REQUEST, {{"error", "no device_id registered"}});
-    }
-
-    json payload = {{"device_id", device_id}};
-    auto result = mgmt_post_json(cfg.api_handshake, payload);
-    if (result.is_null() || !result.value("success", false)) {
-        return send_json(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, {{"error", "handshake failed"}});
-    }
-
-    auto data = result["data"];
-
-    // Save user info to DB
-    sqlite3* db2 = nullptr;
-    if (sqlite3_open(cfg.db_path.c_str(), &db2) == SQLITE_OK) {
-        sqlite3_stmt* stmt;
-        sqlite3_prepare_v2(db2,
-            "INSERT OR REPLACE INTO user_info (user_id, name, last_name, email, phone_number, access_token) "
-            "VALUES (?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
-
-        sqlite3_bind_int(stmt, 1, data.value("user_id", 0));
-        auto name = data.value("name", "");
-        auto last = data.value("last_name", "");
-        auto email = data.value("email", "");
-        std::string phone = data.value("phone_code", "") + data.value("phone", "");
-        auto token = data.value("access_token", "");
-
-        sqlite3_bind_text(stmt, 2, name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, last.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, email.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, phone.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 6, token.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        sqlite3_close(db2);
-    }
-
-    return send_json(conn, MHD_HTTP_OK, data);
-}
-
-static MHD_Result handle_set_speed(struct MHD_Connection* conn, const std::string& body) {
+static MHD_Result handle_config_post(struct MHD_Connection* conn, const std::string& body) {
     try {
         auto j = json::parse(body);
-        if (j.contains("speed")) {
-            config().speed_threshold = j["speed"].get<int>();
-            return send_json(conn, MHD_HTTP_OK, {{"speed_threshold", config().speed_threshold}});
-        }
-    } catch (...) {}
-    return send_json(conn, MHD_HTTP_BAD_REQUEST, {{"error", "missing 'speed'"}});
-}
-
-static MHD_Result handle_wifi(struct MHD_Connection* conn, const std::string& body) {
-    try {
-        auto j = json::parse(body);
-        std::string ssid = j.value("ssid", "");
-        std::string password = j.value("password", "");
-        if (ssid.empty()) {
-            return send_json(conn, MHD_HTTP_BAD_REQUEST, {{"error", "missing 'ssid'"}});
-        }
-
-        // nmcli connect
-        std::string cmd = "nmcli device wifi connect '" + ssid + "' password '" + password + "' 2>&1";
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (!pipe) {
-            return send_json(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, {{"error", "popen failed"}});
-        }
-        char buf[256];
-        std::string output;
-        while (fgets(buf, sizeof(buf), pipe)) output += buf;
-        int ret = pclose(pipe);
-
-        if (ret == 0) {
-            return send_json(conn, MHD_HTTP_OK, {{"status", "connected"}, {"ssid", ssid}});
-        } else {
-            return send_json(conn, MHD_HTTP_INTERNAL_SERVER_ERROR,
-                             {{"error", "nmcli failed: " + output}});
-        }
+        auto& cfg = config();
+        if (j.contains("skip_frames")) cfg.skip_frames = j["skip_frames"].get<int>();
+        if (j.contains("eye_closed_prob")) cfg.eye_closed_prob = j["eye_closed_prob"].get<float>();
+        if (j.contains("yawn_prob")) cfg.yawn_prob = j["yawn_prob"].get<float>();
+        if (j.contains("eyes_closed_duration")) cfg.eyes_closed_duration = j["eyes_closed_duration"].get<float>();
+        return send_json(conn, MHD_HTTP_OK, {{"status", "updated"}});
     } catch (...) {
         return send_json(conn, MHD_HTTP_BAD_REQUEST, {{"error", "invalid JSON"}});
     }
+}
+
+static MHD_Result handle_time_sync(struct MHD_Connection* conn, const std::string& body) {
+    try {
+        auto j = json::parse(body);
+        std::string utc = j.value("utc", "");
+        if (utc.empty()) {
+            return send_json(conn, MHD_HTTP_BAD_REQUEST, {{"error", "missing 'utc'"}});
+        }
+        // Set system clock (requires root or sudo NOPASSWD)
+        std::string cmd = "sudo date -s '" + utc + "' > /dev/null 2>&1";
+        int ret = system(cmd.c_str());
+        if (ret == 0) {
+            return send_json(conn, MHD_HTTP_OK, {{"status", "time_set"}, {"utc", utc}});
+        }
+        return send_json(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, {{"error", "date command failed"}});
+    } catch (...) {
+        return send_json(conn, MHD_HTTP_BAD_REQUEST, {{"error", "invalid JSON"}});
+    }
+}
+
+// --- MJPEG stream callback ---
+struct StreamCtx {
+    RingBuffer* ring;
+    std::atomic<bool>* shutdown;
+    int frame_count;
+    bool header_sent;
+};
+
+static ssize_t mjpeg_stream_callback(void* cls, uint64_t pos, char* buf, size_t max) {
+    (void)pos;
+    auto* ctx = static_cast<StreamCtx*>(cls);
+    if (ctx->shutdown->load()) {
+        delete ctx;
+        return MHD_CONTENT_READER_END_OF_STREAM;
+    }
+
+    JpegFrame latest;
+    // Wait briefly for a new frame
+    for (int i = 0; i < 10; i++) {
+        if (ctx->ring->latest(latest)) break;
+        usleep(100000);  // 100ms
+        if (ctx->shutdown->load()) {
+            delete ctx;
+            return MHD_CONTENT_READER_END_OF_STREAM;
+        }
+    }
+
+    if (latest.data.empty()) {
+        delete ctx;
+        return MHD_CONTENT_READER_END_OF_STREAM;
+    }
+
+    // Build multipart chunk
+    std::string header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + std::to_string(latest.data.size()) + "\r\n\r\n";
+    std::string footer = "\r\n";
+
+    size_t total = header.size() + latest.data.size() + footer.size();
+    if (total > max) {
+        // Buffer too small — skip this frame
+        usleep(500000);
+        return 0;
+    }
+
+    memcpy(buf, header.c_str(), header.size());
+    memcpy(buf + header.size(), latest.data.data(), latest.data.size());
+    memcpy(buf + header.size() + latest.data.size(), footer.c_str(), footer.size());
+
+    ctx->frame_count++;
+
+    // Throttle to ~2 fps for preview
+    usleep(500000);
+
+    return static_cast<ssize_t>(total);
+}
+
+static void mjpeg_stream_free(void* cls) {
+    delete static_cast<StreamCtx*>(cls);
+}
+
+static MHD_Result handle_stream(struct MHD_Connection* conn) {
+    auto* ctx = new StreamCtx{g_ring, g_shutdown, 0, false};
+
+    struct MHD_Response* response = MHD_create_response_from_callback(
+        MHD_SIZE_UNKNOWN, 256 * 1024,  // 256KB buffer
+        &mjpeg_stream_callback, ctx, &mjpeg_stream_free);
+
+    MHD_add_response_header(response, "Content-Type",
+                             "multipart/x-mixed-replace; boundary=frame");
+    MHD_add_response_header(response, "Cache-Control", "no-cache");
+    MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+
+    MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, response);
+    MHD_destroy_response(response);
+    return ret;
 }
 
 // --- MHD request handler ---
@@ -342,14 +432,10 @@ static MHD_Result request_handler(void* cls,
 
         // POST body complete — route it
         MHD_Result result;
-        if (strcmp(url, "/api/create_device") == 0) {
-            result = handle_create_device(connection);
-        } else if (strcmp(url, "/api/handshake") == 0) {
-            result = handle_handshake(connection);
-        } else if (strcmp(url, "/api/config/speed") == 0) {
-            result = handle_set_speed(connection, pd->body);
-        } else if (strcmp(url, "/api/wifi") == 0) {
-            result = handle_wifi(connection, pd->body);
+        if (strcmp(url, "/api/config") == 0) {
+            result = handle_config_post(connection, pd->body);
+        } else if (strcmp(url, "/api/time") == 0) {
+            result = handle_time_sync(connection, pd->body);
         } else {
             result = send_json(connection, MHD_HTTP_NOT_FOUND, {{"error", "not found"}});
         }
@@ -358,14 +444,33 @@ static MHD_Result request_handler(void* cls,
         return result;
     }
 
+    // Handle DELETE
+    if (strcmp(method, "DELETE") == 0) {
+        if (strcmp(url, "/api/file") == 0) return handle_delete(connection);
+        return send_json(connection, MHD_HTTP_NOT_FOUND, {{"error", "not found"}});
+    }
+
     // GET routes
     if (strcmp(method, "GET") == 0) {
-        if (strcmp(url, "/health") == 0)       return handle_health(connection);
-        if (strcmp(url, "/api/status") == 0)    return handle_status(connection);
-        if (strcmp(url, "/api/devices") == 0)   return handle_devices(connection);
-        if (strcmp(url, "/api/users") == 0)     return handle_users(connection);
-        if (strcmp(url, "/api/config") == 0)    return handle_get_config(connection);
+        if (strcmp(url, "/health") == 0)          return send_json(connection, MHD_HTTP_OK, {{"status", "ok"}});
+        if (strcmp(url, "/api/status") == 0)       return handle_status(connection);
+        if (strcmp(url, "/api/recordings") == 0)   return handle_recordings(connection);
+        if (strcmp(url, "/api/alerts") == 0)        return handle_alerts(connection);
+        if (strcmp(url, "/api/download") == 0)      return handle_download(connection);
+        if (strcmp(url, "/api/config") == 0)        return handle_config_get(connection);
+        if (strcmp(url, "/api/stream") == 0)        return handle_stream(connection);
         return send_json(connection, MHD_HTTP_NOT_FOUND, {{"error", "not found"}});
+    }
+
+    // CORS preflight
+    if (strcmp(method, "OPTIONS") == 0) {
+        struct MHD_Response* response = MHD_create_response_from_buffer(0, nullptr, MHD_RESPMEM_PERSISTENT);
+        MHD_add_response_header(response, "Access-Control-Allow-Origin", "*");
+        MHD_add_response_header(response, "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        MHD_add_response_header(response, "Access-Control-Allow-Headers", "Content-Type, Range");
+        MHD_Result ret = MHD_queue_response(connection, MHD_HTTP_NO_CONTENT, response);
+        MHD_destroy_response(response);
+        return ret;
     }
 
     return send_json(connection, MHD_HTTP_METHOD_NOT_ALLOWED, {{"error", "method not allowed"}});
@@ -383,33 +488,36 @@ static void request_completed(void* cls, struct MHD_Connection* connection,
     }
 }
 
-void management_service(zmq::context_t& ctx, std::atomic<bool>& shutdown) {
-    (void)ctx;
-    const auto& cfg = config();
-    g_start_time = time(nullptr);
+void start_web_server(int port, AppState& state, RingBuffer& ring_buf,
+                       std::atomic<bool>& shutdown)
+{
+    g_state = &state;
+    g_ring = &ring_buf;
+    g_shutdown = &shutdown;
 
-    struct MHD_Daemon* daemon = MHD_start_daemon(
+    g_daemon = MHD_start_daemon(
         MHD_USE_INTERNAL_POLLING_THREAD,
-        cfg.mgmt_port,
+        port,
         nullptr, nullptr,
         &request_handler, nullptr,
         MHD_OPTION_NOTIFY_COMPLETED, &request_completed, nullptr,
         MHD_OPTION_END
     );
 
-    if (!daemon) {
-        std::cerr << "[mgmt] Failed to start HTTP server on :" << cfg.mgmt_port << std::endl;
+    if (!g_daemon) {
+        std::cerr << "[web] Failed to start HTTP server on :" << port << std::endl;
         return;
     }
 
-    std::cout << "[mgmt] Management HTTP server on :" << cfg.mgmt_port << std::endl;
+    std::cout << "[web] HTTP server on :" << port << std::endl;
+}
 
-    while (!shutdown.load()) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+void stop_web_server() {
+    if (g_daemon) {
+        MHD_stop_daemon(g_daemon);
+        g_daemon = nullptr;
+        std::cout << "[web] HTTP server stopped" << std::endl;
     }
-
-    MHD_stop_daemon(daemon);
-    std::cout << "[mgmt] Management server stopped" << std::endl;
 }
 
 } // namespace dms
