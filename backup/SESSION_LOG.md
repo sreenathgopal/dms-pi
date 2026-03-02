@@ -568,6 +568,149 @@ top -d2
 
 ---
 
+## Memory Management (Auto-configured)
+
+The Pi Zero 2W has only 416MB RAM. With both DMS processes + system overhead, memory management is critical.
+
+### 1. earlyoom Daemon
+
+**Package:** `earlyoom` — kills processes before the Linux OOM killer triggers (which often picks the wrong process).
+
+**Config:** `/etc/default/earlyoom`
+```
+EARLYOOM_ARGS="-m 10 -s 25 --avoid '(dms_optimized|video_recorder|rpicam-vid)' --prefer '(chrome|firefox|apt)' -r 10 -n"
+```
+
+- `-m 10` — trigger when memory drops below 10%
+- `-s 25` — trigger when swap drops below 25%
+- `--avoid` — never kill DMS processes
+- `--prefer` — kill browsers/apt first if memory is critical
+- `-r 10` — check every 10 seconds
+
+### 2. Systemd Memory Limits
+
+Drop-in configs enforce per-service memory caps:
+
+**Recorder:** `/etc/systemd/system/dms-recorder.service.d/memory.conf`
+```ini
+[Service]
+MemoryMax=100M
+MemoryHigh=80M
+```
+
+**Detector:** `/etc/systemd/system/dms-detector.service.d/memory.conf`
+```ini
+[Service]
+MemoryMax=180M
+MemoryHigh=150M
+```
+
+- `MemoryHigh` — soft limit, triggers throttling when exceeded
+- `MemoryMax` — hard limit, OOM-kills the service if exceeded
+- Combined max: 280MB (leaves ~136MB for system)
+
+### 3. Kernel Tuning
+
+**File:** `/etc/sysctl.d/99-dms.conf`
+```
+vm.swappiness=30
+vm.vfs_cache_pressure=150
+```
+
+- `vm.swappiness=30` — reduce swap usage (default 60), prefer keeping DMS in RAM
+- `vm.vfs_cache_pressure=150` — more aggressively reclaim filesystem caches (default 100)
+
+### 4. Enhanced Watchdog (Memory Monitoring)
+
+The watchdog script (`/usr/local/bin/dms-watchdog.sh`) now monitors memory and per-process RSS:
+
+```bash
+#!/bin/bash
+# DMS Watchdog — runs every 5 min via cron
+# Checks services + memory, restarts if needed
+
+LOG=/tmp/dms-watchdog.log
+DATE=$(date '+%Y-%m-%d %H:%M:%S')
+
+RECORDER_ACTIVE=$(systemctl is-active dms-recorder.service)
+DETECTOR_ACTIVE=$(systemctl is-active dms-detector.service)
+
+# Get memory stats
+MEM_TOTAL=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+MEM_AVAIL=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+SWAP_TOTAL=$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo)
+SWAP_FREE=$(awk '/SwapFree/ {print int($2/1024)}' /proc/meminfo)
+SWAP_USED=$((SWAP_TOTAL - SWAP_FREE))
+MEM_PCT=$((MEM_AVAIL * 100 / MEM_TOTAL))
+
+# Get per-process RSS in MB via ps
+REC_KB=$(ps -C video_recorder -o rss= 2>/dev/null | head -1 | tr -d ' ')
+DET_KB=$(ps -C python3 -o rss= 2>/dev/null | head -1 | tr -d ' ')
+REC_MB=0; [[ "$REC_KB" =~ ^[0-9]+$ ]] && REC_MB=$((REC_KB / 1024))
+DET_MB=0; [[ "$DET_KB" =~ ^[0-9]+$ ]] && DET_MB=$((DET_KB / 1024))
+
+# Log status
+echo "[$DATE] MEM: ${MEM_AVAIL}MB/${MEM_TOTAL}MB free ${MEM_PCT}% SWAP: ${SWAP_USED}MB | rec=${REC_MB}MB det=${DET_MB}MB | recorder=$RECORDER_ACTIVE detector=$DETECTOR_ACTIVE" >> $LOG
+
+# Check services
+if [ "$RECORDER_ACTIVE" != "active" ] || [ "$DETECTOR_ACTIVE" != "active" ]; then
+    echo "[$DATE] ACTION: Service down — restarting both" >> $LOG
+    systemctl restart dms-recorder.service
+    sleep 5
+    systemctl restart dms-detector.service
+    echo "[$DATE] ACTION: Services restarted" >> $LOG
+fi
+
+# Check critical memory (< 5% available)
+if [ "$MEM_PCT" -lt 5 ]; then
+    echo "[$DATE] ACTION: Critical memory ${MEM_PCT}% — clearing caches and restarting" >> $LOG
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+    systemctl restart dms-recorder.service
+    sleep 5
+    systemctl restart dms-detector.service
+    echo "[$DATE] ACTION: Caches cleared, services restarted" >> $LOG
+fi
+
+# Check high swap (> 2GB used — sign of memory pressure)
+if [ "$SWAP_USED" -gt 2048 ]; then
+    echo "[$DATE] WARNING: High swap usage ${SWAP_USED}MB" >> $LOG
+fi
+
+# Keep log small
+tail -200 $LOG > $LOG.tmp && mv $LOG.tmp $LOG
+```
+
+**What changed from the basic watchdog:**
+- Logs system memory (available/total, percentage, swap usage)
+- Logs per-process RSS for recorder and detector
+- On critical memory (< 5%): drops filesystem caches + restarts both services
+- Warns on high swap usage (> 2GB)
+- Keeps 200 lines of history (vs 100 before)
+
+### Example watchdog log output:
+```
+[2026-03-02 05:49:23] MEM: 183MB/416MB free 43% SWAP: 84MB | rec=14MB det=11MB | recorder=active detector=active
+```
+
+### Memory monitoring commands:
+```bash
+# Live memory stats
+watch -n 5 'free -m && echo "---" && ps -C video_recorder,python3 -o pid,rss,comm'
+
+# Watchdog history
+cat /tmp/dms-watchdog.log
+
+# earlyoom status
+sudo systemctl status earlyoom
+
+# Check systemd memory limits
+systemctl show dms-recorder -p MemoryMax,MemoryHigh
+systemctl show dms-detector -p MemoryMax,MemoryHigh
+```
+
+---
+
 ## What's Next
 - Build and deploy the dms-pi C++ version (replaces Python DMS)
 - Add continuous H.264 recording via `tee` in the rpicam-vid pipeline
