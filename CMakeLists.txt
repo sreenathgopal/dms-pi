@@ -30,14 +30,18 @@ if(NOT TFLITE_LIB)
     message(WARNING "TFLite not found — building without TFLite support")
     set(TFLITE_LIB "")
     add_compile_definitions(DMS_NO_TFLITE)
-endif()
-
-# TFLite headers
-if(TFLITE_LIB)
-    set(TFLITE_INCLUDE_DIRS
-        /usr/local/include
-        /usr/local/include/flatbuffers
-    )
+else()
+    message(STATUS "TFLite found: ${TFLITE_LIB}")
+    # Collect all TFLite dependency static libs
+    file(GLOB TFLITE_DEP_LIBS /usr/local/lib/libabsl_*.a
+                               /usr/local/lib/libruy_*.a
+                               /usr/local/lib/libflatbuffers.a
+                               /usr/local/lib/libfarmhash.a
+                               /usr/local/lib/libfft2d_*.a
+                               /usr/local/lib/libXNNPACK.a
+                               /usr/local/lib/libpthreadpool.a
+                               /usr/local/lib/libcpuinfo*.a
+                               /usr/local/lib/libeight_bit_int_gemm.a)
 endif()
 
 # --- DMS executable ---
@@ -56,8 +60,12 @@ target_include_directories(dms PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${OpenCV_INCLUDE_DIRS}
     ${MHD_INCLUDE_DIRS}
-    ${TFLITE_INCLUDE_DIRS}
 )
+
+# TFLite headers at /usr/local/include — use SYSTEM to avoid shadowing std headers
+if(TFLITE_LIB)
+    target_include_directories(dms SYSTEM PRIVATE /usr/local/include)
+endif()
 
 target_link_libraries(dms PRIVATE
     ${OpenCV_LIBS}
@@ -69,7 +77,7 @@ target_link_libraries(dms PRIVATE
 target_link_libraries(dms PRIVATE pthread dl)
 
 if(TFLITE_LIB)
-    target_link_libraries(dms PRIVATE ${TFLITE_LIB})
+    target_link_libraries(dms PRIVATE ${TFLITE_LIB} ${TFLITE_DEP_LIBS})
 endif()
 
 if(GPIOD_FOUND)
