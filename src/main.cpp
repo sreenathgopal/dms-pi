@@ -22,9 +22,10 @@
 #include <unistd.h>
 
 static std::atomic<bool> g_shutdown{false};
+static bool g_debug = false;
 
 static void signal_handler(int sig) {
-    std::cout << "\n[main] Shutdown signal received (" << sig << ")" << std::endl;
+    if (g_debug) std::cout << "\n[main] Signal " << sig << std::endl;
     g_shutdown.store(true);
 }
 
@@ -65,7 +66,6 @@ static void save_alert_clip(std::vector<dms::JpegFrame> pre_frames,
                              const std::string& alerts_dir,
                              int post_seconds, int fps)
 {
-    // Generate filename
     time_t now = time(nullptr);
     struct tm tm_buf;
     localtime_r(&now, &tm_buf);
@@ -75,10 +75,9 @@ static void save_alert_clip(std::vector<dms::JpegFrame> pre_frames,
              tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
              tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
 
-    std::cout << "[alert] Saving clip: " << fname << " (pre=" << pre_frames.size()
-              << " frames, post=" << post_seconds << "s)" << std::endl;
+    std::cout << "[alert] Saving clip: " << fname
+              << " (" << pre_frames.size() << " pre-frames)" << std::endl;
 
-    // Decode first frame to get dimensions
     if (pre_frames.empty()) return;
     cv::Mat sample = cv::imdecode(pre_frames[0].data, cv::IMREAD_COLOR);
     if (sample.empty()) return;
@@ -100,7 +99,6 @@ static void save_alert_clip(std::vector<dms::JpegFrame> pre_frames,
     time_t end_time = time(nullptr) + post_seconds;
     while (time(nullptr) < end_time) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        // Get latest frames from ring buffer
         auto recent = ring_buf->snapshot(1);
         for (auto& f : recent) {
             cv::Mat decoded = cv::imdecode(f.data, cv::IMREAD_COLOR);
@@ -128,10 +126,10 @@ static void detection_thread(dms::FrameSlot& slot, dms::RingBuffer& ring_buf,
     if (cfg.use_tflite) {
         classifier = std::make_unique<dms::DrowsinessClassifier>(cfg.tflite_model_path);
         if (!classifier->is_loaded()) {
-            std::cout << "[detect] TFLite classifier not available, using threshold fallback" << std::endl;
+            std::cout << "[detect] Classifier unavailable, threshold fallback" << std::endl;
             classifier.reset();
         } else {
-            std::cout << "[detect] TFLite INT8 classifier enabled" << std::endl;
+            std::cout << "[detect] TFLite INT8 classifier loaded" << std::endl;
         }
     }
 
@@ -142,13 +140,13 @@ static void detection_thread(dms::FrameSlot& slot, dms::RingBuffer& ring_buf,
     auto fps_time = std::chrono::steady_clock::now();
     float current_fps = 0;
 
-    std::cout << "[detect] Detection thread running" << std::endl;
+    std::cout << "[detect] Running" << std::endl;
 
     while (!shutdown.load()) {
         cv::Mat frame;
         if (!slot.wait(frame, shutdown)) continue;
 
-        // Face detection (YuNet)
+        // Face detection
         dms::FaceBox face;
         bool face_found = face_det.detect(frame, face);
 
@@ -180,14 +178,11 @@ static void detection_thread(dms::FrameSlot& slot, dms::RingBuffer& ring_buf,
         // State machine
         auto [status, buzz, is_new] = fsm.update(face_found, eye_prob, yawn_prob_val, 0);
 
-        // GPIO inline
-        if (buzz == "short") {
-            dms::gpio_buzz(cfg.buzzer_duration);
-        } else if (buzz == "long") {
-            dms::gpio_buzz(cfg.buzzer_duration * 3);
-        }
+        // GPIO
+        if (buzz == "short") dms::gpio_buzz(cfg.buzzer_duration);
+        else if (buzz == "long") dms::gpio_buzz(cfg.buzzer_duration * 3);
 
-        // LED control
+        // LED
         bool is_alert = (status == "sleeping" || status == "yawning" || status == "no_face");
         bool was_alert = (last_led_status == "sleeping" || last_led_status == "yawning" || last_led_status == "no_face");
         if (is_alert && !was_alert) dms::gpio_led(true);
@@ -196,6 +191,7 @@ static void detection_thread(dms::FrameSlot& slot, dms::RingBuffer& ring_buf,
 
         // Alert clip
         if (is_new && (status == "sleeping" || status == "yawning")) {
+            std::cout << "[alert] " << status << " detected!" << std::endl;
             auto pre_frames = ring_buf.snapshot(cfg.alert_pre_seconds);
             std::thread(save_alert_clip, std::move(pre_frames), &ring_buf,
                         cfg.alerts_dir, cfg.alert_post_seconds, cfg.fps).detach();
@@ -207,8 +203,12 @@ static void detection_thread(dms::FrameSlot& slot, dms::RingBuffer& ring_buf,
         double elapsed = std::chrono::duration<double>(now - fps_time).count();
         if (elapsed >= 10.0) {
             current_fps = static_cast<float>(fps_counter / elapsed);
-            std::cout << "[detect] FPS: " << current_fps
-                      << " | state=" << status << std::endl;
+            if (g_debug) {
+                std::cout << "[detect] FPS=" << current_fps
+                          << " state=" << status
+                          << " ear=" << ear_l << "/" << ear_r
+                          << " mar=" << mar_val << std::endl;
+            }
             fps_counter = 0;
             fps_time = now;
         }
@@ -223,14 +223,14 @@ static void detection_thread(dms::FrameSlot& slot, dms::RingBuffer& ring_buf,
     }
 
     dms::gpio_led(false);
-    std::cout << "[detect] Detection thread stopped" << std::endl;
+    if (g_debug) std::cout << "[detect] Stopped" << std::endl;
 }
 
-// --- Print usage ---
 static void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " [options]\n"
-              << "  --stdin       Read MJPEG from stdin (pipe from rpicam-vid)\n"
-              << "  --headless    No display (required on Pi)\n"
+              << "  --stdin       Read MJPEG from stdin pipe (required)\n"
+              << "  --headless    No display (always on Pi)\n"
+              << "  --debug       Verbose logging (FPS, per-frame stats)\n"
               << "  --fps N       Override FPS (default: from config)\n"
               << "  --port N      Override web port (default: 8080)\n"
               << "  --help        Show this help\n";
@@ -238,20 +238,18 @@ static void print_usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     bool use_stdin = false;
-    bool headless = false;
     int override_fps = 0;
     int override_port = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdin") == 0) use_stdin = true;
-        else if (strcmp(argv[i], "--headless") == 0) headless = true;
+        else if (strcmp(argv[i], "--headless") == 0) { /* always headless */ }
+        else if (strcmp(argv[i], "--debug") == 0) g_debug = true;
         else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) override_fps = atoi(argv[++i]);
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) override_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0) { print_usage(argv[0]); return 0; }
         else { std::cerr << "Unknown option: " << argv[i] << std::endl; return 1; }
     }
-
-    (void)headless;  // always headless on Pi
 
     // Load configuration
     dms::load_config(dms::config());
@@ -259,64 +257,54 @@ int main(int argc, char* argv[]) {
     if (override_fps > 0) cfg.fps = override_fps;
     if (override_port > 0) cfg.web_port = override_port;
 
-    std::cout << "=== DMS starting (C++ unified binary) ===" << std::endl;
-    std::cout << "Config: " << cfg.frame_w << "x" << cfg.frame_h
-              << " @" << cfg.fps << "fps, skip=" << cfg.skip_frames
-              << ", tflite=" << (cfg.use_tflite ? "true" : "false")
-              << ", port=" << cfg.web_port << std::endl;
+    std::cout << "DMS v3.0 | " << cfg.frame_w << "x" << cfg.frame_h
+              << " @" << cfg.fps << "fps"
+              << " | skip=" << cfg.skip_frames
+              << " | tflite=" << (cfg.use_tflite ? "on" : "off")
+              << " | port=" << cfg.web_port;
+    if (g_debug) std::cout << " | DEBUG";
+    std::cout << std::endl;
 
     if (!use_stdin) {
-        std::cerr << "[main] ERROR: --stdin required (pipe MJPEG from rpicam-vid)" << std::endl;
+        std::cerr << "Error: --stdin required (pipe MJPEG from rpicam-vid)" << std::endl;
         return 1;
     }
 
-    // Signal handling
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    // Ensure directories exist
     mkdir(cfg.alerts_dir.c_str(), 0755);
     mkdir(cfg.recordings_dir.c_str(), 0755);
 
-    // Init GPIO
     dms::gpio_init();
 
-    // Ring buffer: fps * ring_buffer_seconds frames
     size_t ring_capacity = static_cast<size_t>(cfg.fps * cfg.ring_buffer_seconds);
     dms::RingBuffer ring_buf(ring_capacity);
 
-    // Shared state
     dms::AppState app_state;
     app_state.start_time = time(nullptr);
 
-    // Frame slot (capture → detection)
     dms::FrameSlot frame_slot;
 
-    // Start web server
     dms::start_web_server(cfg.web_port, app_state, ring_buf, g_shutdown);
 
-    // Start detection thread
     std::thread det_thread(detection_thread, std::ref(frame_slot), std::ref(ring_buf),
                             std::ref(app_state), std::ref(g_shutdown));
 
-    std::cout << "=== DMS running (capture + detection + web) ===" << std::endl;
-
-    // Main thread = capture loop (read MJPEG from stdin)
+    // Main thread = capture loop
     std::vector<uint8_t> jpeg_buf;
     int frame_count = 0;
 
     while (!g_shutdown.load()) {
         if (!read_mjpeg_frame(jpeg_buf)) {
-            std::cerr << "[main] stdin EOF — shutting down" << std::endl;
+            if (g_debug) std::cerr << "[main] stdin EOF" << std::endl;
             g_shutdown.store(true);
             break;
         }
 
-        // Push raw JPEG to ring buffer (zero CPU — just a memcpy)
         ring_buf.push(jpeg_buf, time(nullptr));
         frame_count++;
 
-        // Only decode every Nth frame for detection
         if (frame_count % (cfg.skip_frames + 1) != 0) continue;
 
         cv::Mat decoded = cv::imdecode(jpeg_buf, cv::IMREAD_COLOR);
@@ -325,21 +313,14 @@ int main(int argc, char* argv[]) {
         frame_slot.push(decoded);
     }
 
-    // Shutdown
-    std::cout << "=== DMS shutting down ===" << std::endl;
     g_shutdown.store(true);
-
-    // Wake up detection thread
     frame_slot.cv.notify_all();
 
-    if (det_thread.joinable()) {
-        det_thread.join();
-        std::cout << "[main] Detection thread stopped" << std::endl;
-    }
+    if (det_thread.joinable()) det_thread.join();
 
     dms::stop_web_server();
     dms::gpio_cleanup();
 
-    std::cout << "=== DMS stopped ===" << std::endl;
+    std::cout << "DMS stopped (frames=" << frame_count << ")" << std::endl;
     return 0;
 }
