@@ -711,6 +711,59 @@ systemctl show dms-detector -p MemoryMax,MemoryHigh
 
 ---
 
+## Test Results (2026-03-02)
+
+### Service Auto-Start After Reboot
+- Pi rebooted, both services came back automatically
+- `dms-recorder.service` — active, running since boot
+- `dms-detector.service` — active, 10.6 FPS immediately after boot
+
+### Face Detection Test
+- Camera pointed at face → `NoFace:0`, EAR and MAR values updating in real-time
+- **EAR** (Eye Aspect Ratio): ~0.25-0.40 with eyes open, drops to ~0.08-0.12 when closed
+- **MAR** (Mouth Aspect Ratio): ~0.01-0.03 with mouth closed, spikes to ~0.35-0.63 when yawning
+- Steady **10.6 FPS** during face tracking (9.3-11.6 FPS range)
+
+### Eye Closure Alert Test
+- Closed eyes for ~3 seconds
+- `[EYE] Event > 2s! 300s monitoring started.` → `[EYE] 2ND EVENT! ALERT TRIGGERED!`
+- `[ZMQ] Sent: ALERT_EYE` — alert sent to recorder via ZMQ
+- Alert clip saved: `alert_ALERT_EYE_2026-03-02_05-51-40.avi` (25MB)
+- Eye state auto-reset after 30s
+
+### Yawn Detection Test
+- `[YAWN] Event > 2s! 300s monitoring started.` → `[YAWN] 2ND EVENT! ALERT TRIGGERED!`
+- MAR spiked to 0.626 during yawn
+- Yawn detection working with 1.0s trigger (separate from eye 2.0s trigger)
+
+### Alert Clips Saved
+| File | Size | Trigger |
+|------|------|---------|
+| `alert_ALERT_EYE_2026-03-02_05-39-55.avi` | 22MB | Eye closure (auto-start test) |
+| `alert_ALERT_EYE_2026-03-02_05-51-40.avi` | 25MB | Eye closure (manual test) |
+
+Both clips downloaded to `backup/alerts/` and cleaned from Pi.
+
+### Memory During Testing
+```
+MEM: 200MB/416MB free 48% SWAP: 84MB | rec=14MB det=40MB | recorder=active detector=active
+```
+- Detector RAM increased from 11MB (no face) to 40MB (active face tracking + landmarks)
+- System remained stable with 48% memory free
+- Watchdog checks all passing OK
+
+### Summary
+All systems operational:
+- Auto-start on boot: **working**
+- Face detection: **working** (10.6 FPS)
+- Eye closure detection + alert: **working** (2s trigger)
+- Yawn detection + alert: **working** (1s trigger)
+- ZMQ alert → clip saving: **working**
+- Watchdog monitoring: **working** (every 5 min)
+- Memory management: **stable** (200MB free, 84MB swap)
+
+---
+
 ## What's Next
 - Build and deploy the dms-pi C++ version (replaces Python DMS)
 - Add continuous H.264 recording via `tee` in the rpicam-vid pipeline
