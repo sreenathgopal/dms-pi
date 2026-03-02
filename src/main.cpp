@@ -9,6 +9,7 @@
 #include <dms/management_service.h>
 
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/videoio.hpp>
 #include <iostream>
 #include <thread>
 #include <atomic>
