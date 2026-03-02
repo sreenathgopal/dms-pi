@@ -382,9 +382,172 @@ yawn_tracker = EventTracker("YAWN", trigger_secs=YAWN_TRIGGER)
 
 ---
 
-## How to Start the System
+## Systemd Services (Auto-Start on Boot)
+
+Both apps are configured as systemd services that start automatically on boot and restart on failure.
+
+### Service 1: `dms-recorder.service`
+
+**File:** `/etc/systemd/system/dms-recorder.service`
+
+```ini
+[Unit]
+Description=DMS Video Recorder (rpicam-vid + ZMQ publisher)
+After=network.target
+Before=dms-detector.service
+
+[Service]
+Type=simple
+User=test
+WorkingDirectory=/home/test/video_recorder
+ExecStart=/bin/bash -c 'rpicam-vid -t 0 --width 640 --height 480 --framerate 10 --codec mjpeg --nopreview -o - 2>/dev/null | /home/test/video_recorder/build/video_recorder --stdin --headless'
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/home/test
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Key details:**
+- `After=network.target` — starts after basic system init
+- `Before=dms-detector.service` — ensures recorder starts before the DMS detector
+- `Restart=always` + `RestartSec=5` — if the process dies, systemd restarts it after 5 seconds
+- `User=test` — runs as the `test` user (has `video` group for camera access)
+- The `ExecStart` runs the rpicam-vid pipe exactly as tested in the manual setup
+
+### Service 2: `dms-detector.service`
+
+**File:** `/etc/systemd/system/dms-detector.service`
+
+```ini
+[Unit]
+Description=DMS Drowsiness Detector (Python)
+After=dms-recorder.service
+Requires=dms-recorder.service
+
+[Service]
+Type=simple
+User=test
+WorkingDirectory=/home/test/dms
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/python3 -u /home/test/dms/dms_optimized.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/home/test
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Key details:**
+- `After=dms-recorder.service` + `Requires=dms-recorder.service` — won't start unless recorder is running; if recorder stops, detector stops too
+- `ExecStartPre=/bin/sleep 3` — waits 3 seconds before starting to ensure the recorder's ZMQ publisher is ready
+- `python3 -u` — unbuffered output so logs appear immediately in journalctl
+- `Restart=always` — auto-restart on crash
+
+### Service dependency chain:
+```
+boot → network.target → dms-recorder.service → (3s delay) → dms-detector.service
+                              │                                      │
+                         rpicam-vid pipe                    Python DMS detector
+                         + video_recorder                  (YuNet + TFLite)
+                         ZMQ :5556 (frames)  ←──────────→  ZMQ :5555 (alerts)
+```
+
+---
+
+## Watchdog Cron Job
+
+A cron job runs every 5 minutes to verify both services are active. If either is down, it restarts both.
+
+### Watchdog Script
+
+**File:** `/usr/local/bin/dms-watchdog.sh`
 
 ```bash
+#!/bin/bash
+# DMS Watchdog — checks every 5 min via cron
+# Restarts services if not running
+
+LOG=/tmp/dms-watchdog.log
+DATE=$(date '+%Y-%m-%d %H:%M:%S')
+
+RECORDER_ACTIVE=$(systemctl is-active dms-recorder.service)
+DETECTOR_ACTIVE=$(systemctl is-active dms-detector.service)
+
+if [ "$RECORDER_ACTIVE" != "active" ] || [ "$DETECTOR_ACTIVE" != "active" ]; then
+    echo "[$DATE] WATCHDOG: recorder=$RECORDER_ACTIVE detector=$DETECTOR_ACTIVE — restarting" >> $LOG
+    systemctl restart dms-recorder.service
+    sleep 5
+    systemctl restart dms-detector.service
+    echo "[$DATE] WATCHDOG: services restarted" >> $LOG
+else
+    echo "[$DATE] WATCHDOG: OK (recorder=active, detector=active)" >> $LOG
+fi
+
+# Keep log small (last 100 lines)
+tail -100 $LOG > $LOG.tmp && mv $LOG.tmp $LOG
+```
+
+**How it works:**
+1. Checks `systemctl is-active` for both services
+2. If either returns anything other than "active", restarts both in order (recorder first, 5s wait, then detector)
+3. Logs every check to `/tmp/dms-watchdog.log` (auto-trimmed to 100 lines)
+
+### Cron Entry
+
+**Root crontab** (`sudo crontab -l`):
+```
+*/5 * * * * /usr/local/bin/dms-watchdog.sh
+```
+
+Runs every 5 minutes as root (needs root for `systemctl restart`).
+
+---
+
+## Managing the Services
+
+```bash
+# Check status of both services
+sudo systemctl status dms-recorder dms-detector
+
+# View live DMS detection logs
+journalctl -u dms-detector -f
+
+# View live recorder logs
+journalctl -u dms-recorder -f
+
+# View watchdog history
+cat /tmp/dms-watchdog.log
+
+# Manual restart
+sudo systemctl restart dms-recorder dms-detector
+
+# Stop both services
+sudo systemctl stop dms-detector dms-recorder
+
+# Disable auto-start on boot
+sudo systemctl disable dms-recorder dms-detector
+
+# Re-enable auto-start
+sudo systemctl enable dms-recorder dms-detector
+```
+
+---
+
+## How to Start the System (Manual — for debugging)
+
+If you need to run outside systemd (e.g., for debugging):
+
+```bash
+# Stop services first
+sudo systemctl stop dms-detector dms-recorder
+
 # SSH into Pi
 ssh -i .ssh/dms_pi test@192.168.68.100
 
@@ -409,6 +572,5 @@ top -d2
 - Build and deploy the dms-pi C++ version (replaces Python DMS)
 - Add continuous H.264 recording via `tee` in the rpicam-vid pipeline
 - Consider higher resolution (1080p) with H.264 hardware encoding + tee split
-- Systemd service setup for auto-start on boot
 - GPS hardware integration
 - Alert buzzer/LED via libgpiod
