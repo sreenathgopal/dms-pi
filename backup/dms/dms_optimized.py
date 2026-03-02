@@ -1,0 +1,764 @@
+"""
+LIGHTWEIGHT DROWSINESS DETECTION FOR PI ZERO 2 W
+==================================================
+Optimized version that eliminates the heavy MediaPipe framework (~80MB RAM).
+
+Uses:
+  - OpenCV YuNet face detector (built-in, no extra downloads)
+  - tflite-runtime for face_landmark model (478 landmarks, ~5MB)
+  - tflite-runtime for drowsiness INT8 classifier (6KB)
+  - Same EAR/MAR computation as before
+  - Same 2-event state machine
+
+Memory: ~80-90 MB total (vs ~270 MB with MediaPipe)
+Speed:  5-10 FPS on Pi Zero 2 W (enough for 2-second eye closure detection)
+
+INSTALL (Pi Zero 2 W / Ubuntu ARM64):
+  sudo apt install -y python3-opencv python3-pip python3-numpy
+  pip3 install tflite-runtime pyzmq --break-system-packages
+
+INSTALL (Windows for testing):
+  pip install opencv-python numpy pyzmq tensorflow
+
+RUN:
+  # With video_recorder:
+  python3 dms_optimized.py
+
+  # Standalone (own camera):
+  python3 dms_optimized.py --standalone
+
+  # Debug logging:
+  python3 dms_optimized.py --debug
+"""
+
+import cv2
+import numpy as np
+import time
+import sys
+import os
+import argparse
+import struct
+import urllib.request
+
+# ── Configuration ──────────────────────────────────────────────────
+
+# Model URLs
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+YUNET_PATH = "models/face_detection_yunet.onnx"
+
+LANDMARK_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+LANDMARK_PATH = "models/face_landmark.tflite"
+
+DROWSINESS_PATH = "models/drowsiness_model_int8.tflite"
+
+# Detection thresholds
+EYE_CLOSED_PROB = 0.5
+YAWN_PROB = 0.25
+
+# State machine
+CLOSURE_TRIGGER = 2.0
+YAWN_TRIGGER = 1.0
+MONITOR_WINDOW = 300.0
+AUTO_RESET_SECS = 30.0
+
+# Smoothing
+BUFFER_SIZE = 5
+PROCESS_WIDTH = 160
+LANDMARK_EVERY_N = 5
+# Frame downscale for faster processing
+
+# Landmark indices (MediaPipe 478-point face mesh)
+LEFT_EYE  = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE = [33, 160, 158, 133, 153, 144]
+UPPER_LIP = [13, 312, 311, 310, 82, 81, 80]
+LOWER_LIP = [14, 317, 402, 318, 87, 178, 88]
+MOUTH_LEFT = 61
+MOUTH_RIGHT = 291
+
+
+# ── Model Downloads ────────────────────────────────────────────────
+
+def ensure_dir(path):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+def download_file(url, path, min_size=1000):
+    ensure_dir(path)
+    if os.path.exists(path) and os.path.getsize(path) > min_size:
+        return True
+    print(f"  Downloading {os.path.basename(path)}...")
+    try:
+        urllib.request.urlretrieve(url, path)
+        print(f"  OK: {os.path.getsize(path) / 1e6:.1f} MB")
+        return True
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        return False
+
+def extract_landmark_from_task(task_path, output_path):
+    """Extract face_landmark.tflite from MediaPipe .task file.
+    .task files are tar.gz archives containing the raw tflite model."""
+    import tarfile
+    import tempfile
+
+    ensure_dir(output_path)
+
+    # Download .task file
+    task_file = task_path + ".task"
+    if not download_file(LANDMARK_URL, task_file, min_size=100000):
+        return False
+
+    # .task is a tar.gz - extract it
+    # It contains multiple .tflite files — we want the LARGEST one (the landmark model)
+    try:
+        with tarfile.open(task_file, 'r:*') as tar:
+            tflite_files = []
+            for member in tar.getmembers():
+                if member.name.endswith('.tflite'):
+                    tflite_files.append(member)
+            if tflite_files:
+                # Sort by size, pick largest (landmark model is ~2.6 MB, detector is ~0.2 MB)
+                tflite_files.sort(key=lambda m: m.size, reverse=True)
+                for member in tflite_files:
+                    print(f"    Found: {member.name} ({member.size / 1e6:.1f} MB)")
+                best = tflite_files[0]
+                f = tar.extractfile(best)
+                if f:
+                    with open(output_path, 'wb') as out:
+                        out.write(f.read())
+                    size = os.path.getsize(output_path)
+                    if size > 500000:  # landmark model should be >500 KB
+                        print(f"  Extracted: {output_path} ({size / 1e6:.1f} MB)")
+                        os.remove(task_file)
+                        return True
+                    else:
+                        print(f"  WARNING: Extracted file too small ({size} bytes)")
+    except Exception as e:
+        print(f"  tar extract failed: {e}")
+
+    # Fallback: try as zip
+    try:
+        import zipfile
+        with zipfile.ZipFile(task_file, 'r') as z:
+            tflite_files = [(name, z.getinfo(name).file_size)
+                            for name in z.namelist() if name.endswith('.tflite')]
+            if tflite_files:
+                # Sort by size descending, pick largest
+                tflite_files.sort(key=lambda x: x[1], reverse=True)
+                for name, size in tflite_files:
+                    print(f"    Found: {name} ({size / 1e6:.1f} MB)")
+                best_name = tflite_files[0][0]
+                data = z.read(best_name)
+                with open(output_path, 'wb') as out:
+                    out.write(data)
+                size = os.path.getsize(output_path)
+                if size > 500000:
+                    print(f"  Extracted: {output_path} ({size / 1e6:.1f} MB)")
+    except Exception as e:
+        print(f"  zip extract failed: {e}")
+
+    # Cleanup task file
+    try:
+        if os.path.exists(task_file):
+            os.remove(task_file)
+    except Exception:
+        pass  # Windows may lock the file, ignore
+
+    # Final check: did we get a valid file?
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 500000:
+        return True
+
+    return False
+
+def download_models():
+    """Download all required models."""
+    print("\nChecking models...")
+
+    # 1. YuNet face detector
+    if not download_file(YUNET_URL, YUNET_PATH):
+        print("  ERROR: Cannot download YuNet model")
+        return False
+    else:
+        print(f"  YuNet: {YUNET_PATH} ({os.path.getsize(YUNET_PATH) / 1e6:.1f} MB)")
+
+    # 2. Face landmark model
+    if os.path.exists(LANDMARK_PATH) and os.path.getsize(LANDMARK_PATH) > 100000:
+        print(f"  Landmark: {LANDMARK_PATH} ({os.path.getsize(LANDMARK_PATH) / 1e6:.1f} MB)")
+    else:
+        print("  Extracting face landmark model from MediaPipe .task file...")
+        if not extract_landmark_from_task(LANDMARK_PATH, LANDMARK_PATH):
+            # Fallback: try extracting from mediapipe pip package
+            try:
+                import mediapipe
+                mp_dir = os.path.dirname(mediapipe.__file__)
+                src = os.path.join(mp_dir, "modules", "face_landmark",
+                                   "face_landmark_with_attention.tflite")
+                if os.path.exists(src):
+                    ensure_dir(LANDMARK_PATH)
+                    import shutil
+                    shutil.copy(src, LANDMARK_PATH)
+                    print(f"  Copied from mediapipe: {LANDMARK_PATH}")
+                else:
+                    print(f"  ERROR: Cannot find face landmark model")
+                    return False
+            except ImportError:
+                print("  ERROR: Cannot get face landmark model.")
+                print("  Manual fix: pip install mediapipe, then copy")
+                print("    face_landmark_with_attention.tflite to models/face_landmark.tflite")
+                return False
+
+    # 3. Drowsiness classifier
+    if os.path.exists(DROWSINESS_PATH) and os.path.getsize(DROWSINESS_PATH) > 100:
+        print(f"  Drowsiness: {DROWSINESS_PATH} ({os.path.getsize(DROWSINESS_PATH) / 1e3:.1f} KB)")
+    else:
+        print(f"  ERROR: {DROWSINESS_PATH} not found!")
+        print("  Copy your trained drowsiness_model_int8.tflite to models/")
+        return False
+
+    return True
+
+
+# ── TFLite Interpreter Wrapper ─────────────────────────────────────
+
+def load_tflite(model_path):
+    """Load TFLite model using tflite-runtime, ai-edge-litert, or full tensorflow."""
+    try:
+        from tflite_runtime.interpreter import Interpreter
+    except ImportError:
+        try:
+            from ai_edge_litert.interpreter import Interpreter
+        except ImportError:
+            from tensorflow.lite.python.interpreter import Interpreter
+
+    interpreter = Interpreter(model_path=model_path, num_threads=2)
+    interpreter.allocate_tensors()
+    return interpreter
+
+
+# ── YuNet Face Detector (OpenCV built-in) ──────────────────────────
+
+class FaceDetector:
+    """OpenCV YuNet face detector - no external deps."""
+
+    def __init__(self, model_path, input_w=320, input_h=240, conf=0.5):
+        self.detector = cv2.FaceDetectorYN.create(
+            model_path, "", (input_w, input_h),
+            score_threshold=conf, nms_threshold=0.3, top_k=1
+        )
+        self.input_w = input_w
+        self.input_h = input_h
+        print(f"  YuNet face detector loaded ({input_w}x{input_h})")
+
+    def detect(self, frame):
+        """Returns (x, y, w, h, conf) of best face, or None."""
+        h, w = frame.shape[:2]
+        if w != self.input_w or h != self.input_h:
+            self.detector.setInputSize((w, h))
+            self.input_w, self.input_h = w, h
+
+        _, faces = self.detector.detect(frame)
+        if faces is None or len(faces) == 0:
+            return None
+
+        # Return largest/best face
+        best = max(range(len(faces)), key=lambda i: faces[i][2] * faces[i][3])
+        f = faces[best]
+        return (int(f[0]), int(f[1]), int(f[2]), int(f[3]), float(f[-1]))
+
+
+# ── Face Landmark Model (TFLite, replaces MediaPipe) ───────────────
+
+class LandmarkDetector:
+    """478-point face landmark using TFLite directly.
+    Same model MediaPipe uses internally, but loaded without the framework."""
+
+    def __init__(self, model_path):
+        self.interpreter = load_tflite(model_path)
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+
+        inp_shape = self.input_details[0]['shape']
+        self.input_h = inp_shape[1]
+        self.input_w = inp_shape[2]
+        self.input_dtype = self.input_details[0]['dtype']
+
+        print(f"  Landmark model loaded: input {self.input_w}x{self.input_h}")
+        print(f"  Outputs: {len(self.output_details)}")
+        for i, o in enumerate(self.output_details):
+            print(f"    [{i}] shape={o['shape']} dtype={o['dtype']}")
+
+    def detect(self, frame, face_box):
+        """Run landmark detection on face crop.
+        face_box: (x, y, w, h, conf)
+        Returns: list of 478 (x, y) points in original frame coordinates, or None."""
+        fh, fw = frame.shape[:2]
+        x, y, w, h = face_box[0], face_box[1], face_box[2], face_box[3]
+
+        # Expand bbox by 25% for landmark model (needs some margin)
+        expand = 0.25
+        cx, cy = x + w / 2, y + h / 2
+        nw = w * (1 + expand)
+        nh = h * (1 + expand)
+        x1 = max(0, int(cx - nw / 2))
+        y1 = max(0, int(cy - nh / 2))
+        x2 = min(fw, int(cx + nw / 2))
+        y2 = min(fh, int(cy + nh / 2))
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+
+        crop_h, crop_w = crop.shape[:2]
+
+        # Preprocess: resize to model input, RGB, normalize
+        blob = cv2.resize(crop, (self.input_w, self.input_h))
+        blob = cv2.cvtColor(blob, cv2.COLOR_BGR2RGB)
+        blob = blob.astype(np.float32) / 255.0
+        blob = np.expand_dims(blob, axis=0)
+
+        # Run inference
+        self.interpreter.set_tensor(self.input_details[0]['index'], blob)
+        self.interpreter.invoke()
+
+        # Get landmarks output
+        # Output shape is typically [1, 1404] = 468*3 or [1, 1434] = 478*3
+        raw = self.interpreter.get_tensor(self.output_details[0]['index'])
+        raw = raw.flatten()
+
+        if len(raw) >= 478 * 3:
+            num_points = 478
+        elif len(raw) >= 468 * 3:
+            num_points = 468
+        else:
+            return None
+
+        # Parse into landmarks, scale back to original frame coords
+        landmarks = []
+        for i in range(num_points):
+            lx = raw[i * 3 + 0] / self.input_w  # normalized 0-1
+            ly = raw[i * 3 + 1] / self.input_h  # normalized 0-1
+
+            # Map back to original frame
+            orig_x = x1 + lx * crop_w
+            orig_y = y1 + ly * crop_h
+            landmarks.append((orig_x, orig_y))
+
+        # Pad to 478 if we only got 468
+        while len(landmarks) < 478:
+            landmarks.append(landmarks[-1])
+
+        return landmarks
+
+
+# ── Drowsiness Classifier (TFLite INT8) ───────────────────────────
+
+class DrowsinessClassifier:
+    """Same INT8 classifier, loaded via tflite-runtime."""
+
+    def __init__(self, model_path):
+        self.interpreter = load_tflite(model_path)
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+        inp = self.input_details[0]
+        out = self.output_details[0]
+        self.in_scale = inp['quantization'][0]
+        self.in_zero = inp['quantization'][1]
+        self.out_scale = out['quantization'][0]
+        self.out_zero = out['quantization'][1]
+        print(f"  Drowsiness classifier loaded (INT8, scale={self.in_scale:.6f})")
+
+    def predict(self, ear_l, ear_r, mar):
+        inp = np.array([[ear_l, ear_r, mar]], dtype=np.float32)
+        inp_q = np.clip(np.round(inp / self.in_scale + self.in_zero), -128, 127).astype(np.int8)
+        self.interpreter.set_tensor(self.input_details[0]['index'], inp_q)
+        self.interpreter.invoke()
+        out_q = self.interpreter.get_tensor(self.output_details[0]['index'])
+        result = (out_q.astype(np.float32) - self.out_zero) * self.out_scale
+        return float(np.clip(result[0][0], 0, 1)), float(np.clip(result[0][1], 0, 1))
+
+
+# ── EAR / MAR Computation ─────────────────────────────────────────
+
+def euclidean(p1, p2):
+    return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
+
+def compute_ear(landmarks, indices):
+    """Eye Aspect Ratio from 6 landmark points."""
+    pts = [landmarks[i] for i in indices]
+    v1 = euclidean(pts[1], pts[5])
+    v2 = euclidean(pts[2], pts[4])
+    hor = euclidean(pts[0], pts[3])
+    if hor < 1e-6:
+        return 0.3
+    return (v1 + v2) / (2.0 * hor)
+
+def compute_mar(landmarks):
+    """Mouth Aspect Ratio from lip landmark points."""
+    upper = [landmarks[i] for i in UPPER_LIP]
+    lower = [landmarks[i] for i in LOWER_LIP]
+    left = landmarks[MOUTH_LEFT]
+    right = landmarks[MOUTH_RIGHT]
+    vertical = sum(euclidean(u, l) for u, l in zip(upper, lower)) / len(upper)
+    horizontal = euclidean(left, right)
+    if horizontal < 1e-6:
+        return 0.3
+    return vertical / horizontal
+
+
+# ── 2-Event State Machine ─────────────────────────────────────────
+
+class EventTracker:
+    def __init__(self, name, trigger_secs=None):
+        self.name = name
+        self.trigger_secs = trigger_secs if trigger_secs else CLOSURE_TRIGGER
+        self.state = "IDLE"
+        self.event_start = None
+        self.monitor_start = None
+        self.alert_start = None
+
+    def update(self, is_active):
+        now = time.time()
+        if is_active:
+            if self.event_start is None:
+                self.event_start = now
+            duration = now - self.event_start
+        else:
+            duration = 0.0
+            self.event_start = None
+
+        if self.state == "IDLE":
+            if duration >= self.trigger_secs:
+                self.state = "MONITORING"
+                self.monitor_start = now
+                print(f"\n  [{self.name}] Event > 2s! 300s monitoring started.")
+                self.event_start = None
+
+        elif self.state == "MONITORING":
+            elapsed = now - self.monitor_start
+            if elapsed >= MONITOR_WINDOW:
+                self.state = "IDLE"
+                self.monitor_start = None
+                print(f"\n  [{self.name}] 300s passed. Back to IDLE.")
+            elif duration >= self.trigger_secs:
+                self.state = "ALERT"
+                self.alert_start = now
+                print(f"\n  [{self.name}] 2ND EVENT! ALERT TRIGGERED!")
+                self.event_start = None
+
+        elif self.state == "ALERT":
+            if now - self.alert_start >= AUTO_RESET_SECS:
+                self.state = "IDLE"
+                self.event_start = None
+                self.monitor_start = None
+                self.alert_start = None
+                print(f"\n  [{self.name}] Auto-reset after {AUTO_RESET_SECS:.0f}s.")
+
+    def reset(self):
+        self.state = "IDLE"
+        self.event_start = None
+        self.monitor_start = None
+        self.alert_start = None
+
+
+# ── ZMQ Communication ─────────────────────────────────────────────
+
+class ZMQAlertSender:
+    def __init__(self, endpoint="tcp://127.0.0.1:5555"):
+        import zmq
+        self.ctx = zmq.Context()
+        self.sock = self.ctx.socket(zmq.PUB)
+        self.sock.bind(endpoint)
+        time.sleep(0.5)
+        print(f"  [ZMQ] Alert sender on {endpoint}")
+
+    def send_alert(self, alert_type):
+        self.sock.send_string(alert_type)
+        print(f"  [ZMQ] Sent: {alert_type}")
+
+    def close(self):
+        self.sock.close()
+        self.ctx.term()
+
+class ZMQFrameReceiver:
+    def __init__(self, endpoint="tcp://127.0.0.1:5556"):
+        import zmq
+        self.ctx = zmq.Context()
+        self.sock = self.ctx.socket(zmq.SUB)
+        self.sock.connect(endpoint)
+        self.sock.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.sock.setsockopt(zmq.RCVTIMEO, 2000)
+        self.sock.setsockopt(zmq.CONFLATE, 1)
+        print(f"  [ZMQ] Frame receiver on {endpoint}")
+
+    def read(self):
+        import zmq
+        try:
+            data = self.sock.recv()
+            if len(data) < 8:
+                return False, None
+            w = struct.unpack('<i', data[0:4])[0]
+            h = struct.unpack('<i', data[4:8])[0]
+            jpeg_data = np.frombuffer(data[8:], dtype=np.uint8)
+            frame = cv2.imdecode(jpeg_data, cv2.IMREAD_COLOR)
+            if frame is None:
+                return False, None
+            return True, frame
+        except zmq.Again:
+            return False, None
+        except:
+            return False, None
+
+    def close(self):
+        self.sock.close()
+        self.ctx.term()
+
+
+# ── Main ───────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Lightweight Drowsiness Detection")
+    parser.add_argument("--standalone", action="store_true",
+                        help="Use own camera (no video_recorder needed)")
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--debug", action="store_true",
+                        help="Print EAR/MAR every frame")
+    parser.add_argument("--drowsiness-model", default=DROWSINESS_PATH)
+    parser.add_argument("--landmark-model", default=LANDMARK_PATH)
+    parser.add_argument("--yunet-model", default=YUNET_PATH)
+    args = parser.parse_args()
+
+    zmq_mode = not args.standalone
+
+    print("=" * 58)
+    print("  DROWSINESS DETECTION (Optimized for Pi Zero 2 W)")
+    print("=" * 58)
+    print(f"  Mode:      {'ZMQ (from recorder)' if zmq_mode else 'Standalone (own camera)'}")
+    print(f"  Pipeline:  YuNet → TFLite landmarks → EAR/MAR → INT8 classifier")
+    print(f"  Runtime:   tflite-runtime (no MediaPipe)")
+    print(f"  RAM:       ~80-90 MB (vs ~270 MB with MediaPipe)")
+    print()
+
+    # Download/verify models
+    if not download_models():
+        print("\n  ERROR: Models not ready. Fix the above errors and retry.")
+        sys.exit(1)
+
+    # Load models
+    print("\nLoading models...")
+    face_det = FaceDetector(args.yunet_model)
+    landmark_det = LandmarkDetector(args.landmark_model)
+    classifier = DrowsinessClassifier(args.drowsiness_model)
+
+    # Setup frame source
+    zmq_sender = None
+    frame_receiver = None
+    cap = None
+
+    if zmq_mode:
+        print("\nSetting up ZeroMQ...")
+        try:
+            zmq_sender = ZMQAlertSender()
+            frame_receiver = ZMQFrameReceiver()
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            print("  Start video_recorder first, or use --standalone")
+            sys.exit(1)
+    else:
+        print(f"\nOpening camera {args.camera}...")
+        # Try multiple backends (same as video_recorder)
+        backends = [
+            (cv2.CAP_DSHOW, "DirectShow"),
+            (cv2.CAP_MSMF, "MSMF"),
+            (cv2.CAP_ANY, "Auto"),
+        ] if sys.platform == 'win32' else [
+            (cv2.CAP_V4L2, "V4L2"),
+            (cv2.CAP_ANY, "Auto"),
+        ]
+        cap = None
+        for backend, name in backends:
+            print(f"  Trying {name}...")
+            c = cv2.VideoCapture(args.camera, backend)
+            if c.isOpened():
+                cap = c
+                print(f"  Camera opened via {name}")
+                break
+            c.release()
+        if cap is None:
+            print("  ERROR: Cannot open camera!")
+            sys.exit(1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    # State
+    eye_tracker = EventTracker("EYE")
+    yawn_tracker = EventTracker("YAWN", trigger_secs=YAWN_TRIGGER)
+    ear_buffer = []
+    mar_buffer = []
+    eye_alert_sent = False
+    yawn_alert_sent = False
+    landmark_counter = 0
+    cached_ear_l = 0.0
+    cached_ear_r = 0.0
+    cached_mar = 0.0
+    cached_eyes_closed = False
+    cached_is_yawning = False
+
+    frame_count = 0
+    fps_time = time.time()
+    fps_count = 0
+    no_face_count = 0
+
+    print(f"\n  READY! Ctrl+C to stop")
+    print("  " + "-" * 50)
+
+    try:
+        while True:
+            # Get frame
+            if zmq_mode:
+                ret, frame = frame_receiver.read()
+            else:
+                ret, frame = cap.read()
+                if ret:
+                    frame = cv2.flip(frame, 1)
+
+            if not ret or frame is None:
+                time.sleep(0.05)
+                continue
+
+            # Downscale for faster processing
+            h_orig, w_orig = frame.shape[:2]
+            if w_orig > PROCESS_WIDTH:
+                scale = PROCESS_WIDTH / w_orig
+                frame = cv2.resize(frame, (PROCESS_WIDTH, int(h_orig * scale)))
+
+            frame_count += 1
+            fps_count += 1
+
+            # ── Detection pipeline ──────────────────────
+
+            eyes_closed = False
+            is_yawning = False
+            ear_l = ear_r = mar_val = 0.0
+
+            # Step 1: Face detection (YuNet)
+            face = face_det.detect(frame)
+
+            if face is not None:
+                no_face_count = 0
+                landmark_counter += 1
+
+                # Step 2: Landmark detection (only every Nth frame)
+                if landmark_counter >= LANDMARK_EVERY_N:
+                    landmark_counter = 0
+                    landmarks = landmark_det.detect(frame, face)
+
+                    if landmarks is not None and len(landmarks) >= 468:
+                        # Step 3: Compute EAR/MAR
+                        ear_l = compute_ear(landmarks, LEFT_EYE)
+                        ear_r = compute_ear(landmarks, RIGHT_EYE)
+                        mar_val = compute_mar(landmarks)
+
+                        # Cache for reuse
+                        cached_ear_l = ear_l
+                        cached_ear_r = ear_r
+                        cached_mar = mar_val
+
+                        # Smooth
+                        ear_buffer.append((ear_l + ear_r) / 2)
+                        mar_buffer.append(mar_val)
+                        if len(ear_buffer) > BUFFER_SIZE:
+                            ear_buffer.pop(0)
+                        if len(mar_buffer) > BUFFER_SIZE:
+                            mar_buffer.pop(0)
+
+                        # Step 4: Classifier
+                        eye_prob, yawn_prob = classifier.predict(ear_l, ear_r, mar_val)
+                        eyes_closed = (eye_prob > EYE_CLOSED_PROB)
+                        is_yawning = (yawn_prob > YAWN_PROB)
+                        cached_eyes_closed = eyes_closed
+                        cached_is_yawning = is_yawning
+                else:
+                    # Reuse cached values (skip expensive landmark inference)
+                    ear_l = cached_ear_l
+                    ear_r = cached_ear_r
+                    mar_val = cached_mar
+                    eyes_closed = cached_eyes_closed
+                    is_yawning = cached_is_yawning
+
+                    if args.debug and frame_count % 10 == 0:
+                        print(f"  EAR_L:{ear_l:.3f} EAR_R:{ear_r:.3f} "
+                              f"MAR:{mar_val:.3f} eye_p:{eye_prob:.2f} "
+                              f"yawn_p:{yawn_prob:.2f} "
+                              f"{'CLOSED' if eyes_closed else 'open'} "
+                              f"{'YAWN' if is_yawning else ''}")
+            else:
+                no_face_count += 1
+
+            # ── State machine ───────────────────────────
+
+            eye_tracker.update(eyes_closed)
+            yawn_tracker.update(is_yawning)
+
+            # ── Send ZMQ alerts ─────────────────────────
+
+            if zmq_mode and zmq_sender:
+                if eye_tracker.state == "ALERT" and not eye_alert_sent:
+                    atype = "ALERT_BOTH" if yawn_tracker.state == "ALERT" else "ALERT_EYE"
+                    zmq_sender.send_alert(atype)
+                    eye_alert_sent = True
+                if yawn_tracker.state == "ALERT" and not yawn_alert_sent:
+                    if not (eye_tracker.state == "ALERT" and eye_alert_sent):
+                        atype = "ALERT_BOTH" if eye_tracker.state == "ALERT" else "ALERT_YAWN"
+                        zmq_sender.send_alert(atype)
+                    yawn_alert_sent = True
+                if eye_tracker.state != "ALERT":
+                    eye_alert_sent = False
+                if yawn_tracker.state != "ALERT":
+                    yawn_alert_sent = False
+
+            # ── Periodic status log ─────────────────────
+
+            now = time.time()
+            if now - fps_time >= 5.0:
+                fps = fps_count / (now - fps_time)
+                ear_avg = sum(ear_buffer) / len(ear_buffer) if ear_buffer else 0
+                mar_avg = sum(mar_buffer) / len(mar_buffer) if mar_buffer else 0
+
+                # Measure RAM usage
+                ram_mb = 0
+                try:
+                    import psutil
+                    ram_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+                except ImportError:
+                    try:
+                        # Linux fallback
+                        with open(f'/proc/{os.getpid()}/status') as f:
+                            for line in f:
+                                if line.startswith('VmRSS:'):
+                                    ram_mb = int(line.split()[1]) / 1024
+                                    break
+                    except:
+                        pass
+
+                ram_str = f"  RAM:{ram_mb:.0f}MB" if ram_mb > 0 else ""
+                print(f"  FPS:{fps:.1f}  EAR:{ear_avg:.3f}  MAR:{mar_avg:.3f}  "
+                      f"Eye:{eye_tracker.state}  Yawn:{yawn_tracker.state}  "
+                      f"NoFace:{no_face_count}{ram_str}")
+                fps_count = 0
+                fps_time = now
+
+    except KeyboardInterrupt:
+        print("\n\nStopping...")
+    finally:
+        if cap:
+            cap.release()
+        if frame_receiver:
+            frame_receiver.close()
+        if zmq_sender:
+            zmq_sender.close()
+        print("Done.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,603 @@
+/*
+ * video_recorder.cpp
+ * ==================
+ * Cross-platform continuous 1080p video recorder with ZeroMQ alert system.
+ * Works on: Windows, Linux, Raspberry Pi 5
+ *
+ * FEATURES:
+ *   - Continuous 1080p recording, split every 30 minutes
+ *   - Ring buffer holds last 1.5 minutes in RAM
+ *   - ZeroMQ: sends frames to Python (port 5556), receives alerts (port 5555)
+ *   - When alert received: saves 1.5 min before + 1.5 min after = 3 min clip
+ *   - Auto disk cleanup (deletes oldest files when space is low)
+ *   - Preview window with status
+ *
+ * BUILD (Windows):
+ *   mkdir build && cd build
+ *   cmake .. -DOpenCV_DIR=C:\path\to\opencv\build -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+ *   cmake --build . --config Release
+ *
+ * BUILD (Linux / Raspberry Pi 5):
+ *   sudo apt install -y libopencv-dev libzmq3-dev libcppzmq-dev build-essential cmake
+ *   mkdir build && cd build
+ *   cmake ..
+ *   cmake --build .
+ *
+ * RUN:
+ *   ./video_recorder
+ *   ./video_recorder 0 output 30
+ *
+ * STOP:
+ *   Press 'q' or Ctrl+C
+ */
+
+#include <opencv2/opencv.hpp>
+#include <zmq.h>
+#include <zmq.hpp>
+#include <iostream>
+#include <string>
+#include <ctime>
+#include <csignal>
+#include <sstream>
+#include <iomanip>
+#include <vector>
+#include <algorithm>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <windows.h>
+#define MKDIR(dir) _mkdir(dir)
+#else
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <dirent.h>
+#define MKDIR(dir) mkdir(dir, 0755)
+#endif
+
+/* ── Configuration ──────────────────────────────────────── */
+#define DEFAULT_CAMERA      0
+#define DEFAULT_OUTPUT_DIR  "output"
+#define DEFAULT_SPLIT_MINS  30
+#define VIDEO_WIDTH         1920
+#define VIDEO_HEIGHT        1080
+#define VIDEO_FPS           30
+#define PREVIEW_WIDTH       640
+#define PREVIEW_HEIGHT      360
+
+/* Disk management */
+#define MIN_FREE_SPACE_MB   500
+#define CLEANUP_CHECK_SECS  30
+
+/* Ring buffer: 1.5 minutes of pre-alert footage */
+#define RING_BUFFER_SECS    90
+#define RING_BUFFER_FRAMES  (RING_BUFFER_SECS * VIDEO_FPS)
+
+/* Post-alert recording duration */
+#define POST_ALERT_SECS     90
+
+/* Alert clip output folder */
+#define ALERT_DIR           "alerts"
+
+/* ZeroMQ */
+#define ZMQ_ALERT_ENDPOINT  "tcp://127.0.0.1:5555"
+#define ZMQ_FRAME_ENDPOINT  "tcp://127.0.0.1:5556"
+#define FRAME_SEND_WIDTH    640
+#define FRAME_SEND_HEIGHT   480
+
+/* ── Globals ────────────────────────────────────────────── */
+static volatile bool running = true;
+
+void signal_handler(int sig) {
+    (void)sig;
+    std::cout << "\n[INFO] Stopping recorder..." << std::endl;
+    running = false;
+}
+
+/* ── Ring Buffer ────────────────────────────────────────── */
+struct BufferedFrame {
+    std::vector<uchar> jpeg_data;
+    time_t timestamp;
+};
+
+class RingBuffer {
+public:
+    RingBuffer(int max_frames) : max_frames_(max_frames) {}
+
+    void push(const cv::Mat &frame, time_t ts) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        BufferedFrame bf;
+        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
+        cv::imencode(".jpg", frame, bf.jpeg_data, params);
+        bf.timestamp = ts;
+        buffer_.push_back(std::move(bf));
+        while ((int)buffer_.size() > max_frames_)
+            buffer_.pop_front();
+    }
+
+    std::deque<BufferedFrame> snapshot() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return buffer_;
+    }
+
+    int size() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return (int)buffer_.size();
+    }
+
+    long ram_usage_mb() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        long total = 0;
+        for (auto &bf : buffer_)
+            total += (long)bf.jpeg_data.size();
+        return total / (1024 * 1024);
+    }
+
+private:
+    std::deque<BufferedFrame> buffer_;
+    std::mutex mtx_;
+    int max_frames_;
+};
+
+/* ── Disk Space Management ──────────────────────────────── */
+long get_free_space_mb(const std::string &path) {
+#ifdef _WIN32
+    ULARGE_INTEGER free_bytes;
+    if (GetDiskFreeSpaceExA(path.c_str(), &free_bytes, NULL, NULL))
+        return (long)(free_bytes.QuadPart / (1024 * 1024));
+    return -1;
+#else
+    struct statvfs stat;
+    if (statvfs(path.c_str(), &stat) == 0)
+        return (long)((stat.f_bavail * stat.f_frsize) / (1024 * 1024));
+    return -1;
+#endif
+}
+
+bool delete_oldest_file(const std::string &dir) {
+    std::vector<std::string> files;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    std::string pattern = dir + "\\rec_*.avi";
+    HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do { files.push_back(dir + "\\" + fd.cFileName); }
+        while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+#else
+    DIR *d = opendir(dir.c_str());
+    if (d) {
+        struct dirent *entry;
+        while ((entry = readdir(d)) != NULL) {
+            std::string name = entry->d_name;
+            if (name.size() > 4 && name.substr(0, 4) == "rec_" &&
+                name.substr(name.size() - 4) == ".avi")
+                files.push_back(dir + "/" + name);
+        }
+        closedir(d);
+    }
+#endif
+    if (files.size() <= 1) return false;
+    std::sort(files.begin(), files.end());
+    if (std::remove(files[0].c_str()) == 0) {
+        std::cout << "[CLEANUP] Deleted: " << files[0] << "\n";
+        return true;
+    }
+    return false;
+}
+
+void check_and_cleanup(const std::string &dir) {
+    long free_mb = get_free_space_mb(dir);
+    if (free_mb < 0) return;
+    while (free_mb < MIN_FREE_SPACE_MB) {
+        std::cout << "[CLEANUP] Low space: " << free_mb << " MB\n";
+        if (!delete_oldest_file(dir)) break;
+        free_mb = get_free_space_mb(dir);
+        if (free_mb < 0) break;
+    }
+}
+
+/* ── Filename Generator ─────────────────────────────────── */
+std::string generate_filename(const std::string &dir, const std::string &prefix) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    std::ostringstream ss;
+    ss << dir << "/" << prefix
+       << std::setfill('0')
+       << std::setw(4) << (t->tm_year + 1900) << "-"
+       << std::setw(2) << (t->tm_mon + 1) << "-"
+       << std::setw(2) << t->tm_mday << "_"
+       << std::setw(2) << t->tm_hour << "-"
+       << std::setw(2) << t->tm_min << "-"
+       << std::setw(2) << t->tm_sec << ".avi";
+    return ss.str();
+}
+
+/* ── Alert State ────────────────────────────────────────── */
+std::atomic<bool> alert_triggered(false);
+std::atomic<bool> alert_saving(false);
+std::atomic<bool> alert_recording(false);
+std::atomic<int>  post_alert_countdown(0);
+std::mutex post_frames_mtx;
+std::vector<BufferedFrame> post_frames;
+std::mutex alert_type_mtx;
+std::string alert_type_received;
+
+/* ── Alert Clip Writer Thread ───────────────────────────── */
+void save_alert_clip(std::string alert_type,
+                     std::deque<BufferedFrame> pre_frames,
+                     int fw, int fh, int fps) {
+    std::string filename = generate_filename(ALERT_DIR, "alert_" + alert_type + "_");
+    std::cout << "[ALERT] Saving: " << filename << "\n";
+
+    check_and_cleanup(ALERT_DIR);
+
+    int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    cv::VideoWriter wr(filename, fourcc, fps, cv::Size(fw, fh));
+
+    if (!wr.isOpened()) {
+        std::cerr << "[ALERT] Failed to create file!\n";
+        alert_saving = false;
+        return;
+    }
+
+    /* Write pre-alert frames */
+    int pre_count = 0;
+    for (auto &bf : pre_frames) {
+        cv::Mat decoded = cv::imdecode(bf.jpeg_data, cv::IMREAD_COLOR);
+        if (!decoded.empty()) { wr.write(decoded); pre_count++; }
+    }
+    std::cout << "[ALERT] Pre-alert: " << pre_count << " frames\n";
+
+    /* Wait for post-alert recording to finish */
+    while (alert_recording && running)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    /* Write post-alert frames */
+    {
+        std::lock_guard<std::mutex> lock(post_frames_mtx);
+        int post_count = 0;
+        for (auto &bf : post_frames) {
+            cv::Mat decoded = cv::imdecode(bf.jpeg_data, cv::IMREAD_COLOR);
+            if (!decoded.empty()) { wr.write(decoded); post_count++; }
+        }
+        std::cout << "[ALERT] Post-alert: " << post_count << " frames\n";
+        post_frames.clear();
+    }
+
+    wr.release();
+    alert_saving = false;
+    std::cout << "[ALERT] Saved: " << filename << "\n";
+}
+
+/* ── ZeroMQ Listener Thread ─────────────────────────────── */
+void zmq_listener_thread() {
+    try {
+        zmq::context_t context(1);
+        zmq::socket_t subscriber(context, ZMQ_SUB);
+        subscriber.connect(ZMQ_ALERT_ENDPOINT);
+        subscriber.setsockopt(ZMQ_SUBSCRIBE, "", 0);
+        int timeout_ms = 500;
+        subscriber.setsockopt(ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
+
+        std::cout << "[ZMQ] Alert listener on " << ZMQ_ALERT_ENDPOINT << "\n";
+
+        while (running) {
+            zmq::message_t msg;
+            bool received = subscriber.recv(&msg, ZMQ_DONTWAIT);
+            if (!received) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            if (msg.size() > 0) {
+                std::string message(static_cast<char*>(msg.data()), msg.size());
+                std::cout << "[ZMQ] Received: " << message << "\n";
+                if (message.substr(0, 5) == "ALERT") {
+                    if (!alert_saving && !alert_recording) {
+                        std::lock_guard<std::mutex> lock(alert_type_mtx);
+                        alert_type_received = message;
+                        alert_triggered = true;
+                    } else {
+                        std::cout << "[ZMQ] Ignored (already saving).\n";
+                    }
+                } else if (message == "STOP") {
+                    running = false;
+                }
+            }
+        }
+        subscriber.close();
+        context.close();
+    } catch (const zmq::error_t &e) {
+        std::cerr << "[ZMQ] Error: " << e.what() << "\n";
+        std::cerr << "[ZMQ] Recorder continues without ZMQ.\n";
+    }
+}
+
+/* ── Main ───────────────────────────────────────────────── */
+int main(int argc, char *argv[]) {
+    int camera_id = DEFAULT_CAMERA;
+    std::string output_dir = DEFAULT_OUTPUT_DIR;
+    int split_minutes = DEFAULT_SPLIT_MINS;
+    int video_width = VIDEO_WIDTH;
+    int video_height = VIDEO_HEIGHT;
+    int video_fps = VIDEO_FPS;
+    bool headless = false;
+
+    /* Parse named arguments */
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "-h" || arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [options]\n\n"
+                      << "Options:\n"
+                      << "  --camera ID      Camera index (default: 0)\n"
+                      << "  --output DIR     Output folder (default: output)\n"
+                      << "  --split MINS     Minutes per file (default: 30)\n"
+                      << "  --width W        Video width (default: 1920)\n"
+                      << "  --height H       Video height (default: 1080)\n"
+                      << "  --fps FPS        Frames per second (default: 30)\n"
+                      << "  --headless       No preview window; stop with Ctrl+C only\n\n"
+                      << "Examples:\n"
+                      << "  " << argv[0] << "\n"
+                      << "  " << argv[0] << " --width 1280 --height 720 --fps 15\n"
+                      << "  " << argv[0] << " --camera 1 --split 2\n"
+                      << "  " << argv[0] << " --width 640 --height 480 --output recordings\n"
+                      << "  " << argv[0] << " --headless\n";
+            return 0;
+        }
+        else if (arg == "--camera" && i + 1 < argc) { camera_id = std::atoi(argv[++i]); }
+        else if (arg == "--output" && i + 1 < argc) { output_dir = argv[++i]; }
+        else if (arg == "--split"  && i + 1 < argc) { split_minutes = std::atoi(argv[++i]); }
+        else if (arg == "--width"  && i + 1 < argc) { video_width = std::atoi(argv[++i]); }
+        else if (arg == "--height" && i + 1 < argc) { video_height = std::atoi(argv[++i]); }
+        else if (arg == "--fps"    && i + 1 < argc) { video_fps = std::atoi(argv[++i]); }
+        else if (arg == "--headless") { headless = true; }
+        else {
+            std::cerr << "Unknown argument: " << arg << "\n"
+                      << "Use --help for usage.\n";
+            return 1;
+        }
+    }
+
+    if (split_minutes <= 0) split_minutes = DEFAULT_SPLIT_MINS;
+    if (video_width <= 0) video_width = VIDEO_WIDTH;
+    if (video_height <= 0) video_height = VIDEO_HEIGHT;
+    if (video_fps <= 0) video_fps = VIDEO_FPS;
+
+    /* Calculate ring buffer size based on fps */
+    int ring_buffer_frames = RING_BUFFER_SECS * video_fps;
+    int post_alert_frames = POST_ALERT_SECS * video_fps;
+
+    MKDIR(output_dir.c_str());
+    MKDIR(ALERT_DIR);
+
+    std::cout << "==========================================\n"
+              << "  VIDEO RECORDER + ALERT SYSTEM\n"
+              << "==========================================\n"
+              << "  Camera:       " << camera_id << "\n"
+              << "  Resolution:   " << video_width << "x" << video_height
+              << " @ " << video_fps << "fps\n"
+              << "  Output:       " << output_dir << "/\n"
+              << "  Alerts:       " << ALERT_DIR << "/\n"
+              << "  Split every:  " << split_minutes << " min\n"
+              << "  Ring buffer:  " << RING_BUFFER_SECS << "s ("
+              << ring_buffer_frames << " frames)\n"
+              << "  Alert clip:   " << (RING_BUFFER_SECS + POST_ALERT_SECS) << "s\n"
+              << "  ZMQ alerts:   " << ZMQ_ALERT_ENDPOINT << "\n"
+              << "  ZMQ frames:   " << ZMQ_FRAME_ENDPOINT << "\n"
+              << "  Stop:          " << (headless ? "Ctrl+C only (headless)" : "Press 'q' or Ctrl+C") << "\n"
+              << "==========================================\n\n";
+
+    std::signal(SIGINT, signal_handler);
+#ifndef _WIN32
+    std::signal(SIGTERM, signal_handler);
+#endif
+
+    /* Start ZMQ listener */
+    std::thread zmq_thread(zmq_listener_thread);
+    zmq_thread.detach();
+
+    /* Frame publisher socket (sends frames to Python) */
+    zmq::context_t frame_ctx(1);
+    zmq::socket_t frame_pub(frame_ctx, ZMQ_PUB);
+    try {
+        frame_pub.bind(ZMQ_FRAME_ENDPOINT);
+        std::cout << "[ZMQ] Frame publisher on " << ZMQ_FRAME_ENDPOINT << "\n";
+    } catch (const zmq::error_t &e) {
+        std::cerr << "[ZMQ] Frame publisher error: " << e.what() << "\n";
+    }
+
+    /* Open camera */
+    std::cout << "[INFO] Opening camera " << camera_id << "...\n";
+    cv::VideoCapture cap;
+
+    #ifdef _WIN32
+    int backends[] = { cv::CAP_DSHOW, cv::CAP_MSMF, cv::CAP_ANY };
+    const char *backend_names[] = {"DirectShow", "MSMF", "Auto"};
+    int n_backends = 3;
+    #else
+    int backends[] = { cv::CAP_V4L2, cv::CAP_ANY };
+    const char *backend_names[] = {"V4L2", "Auto"};
+    int n_backends = 2;
+    #endif
+
+    for (int i = 0; i < n_backends; i++) {
+        std::cout << "[INFO] Trying " << backend_names[i] << "...\n";
+        cap.open(camera_id, backends[i]);
+        if (cap.isOpened()) {
+            std::cout << "[INFO] Opened with " << backend_names[i] << "\n";
+            break;
+        }
+    }
+
+    if (!cap.isOpened()) {
+        std::cerr << "[ERROR] Cannot open camera!\n";
+        running = false;
+        return 1;
+    }
+
+    cap.set(cv::CAP_PROP_FRAME_WIDTH,  video_width);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, video_height);
+    cap.set(cv::CAP_PROP_FPS,          video_fps);
+    cap.set(cv::CAP_PROP_BUFFERSIZE,   1);
+    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+
+    int actual_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int actual_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    std::cout << "[INFO] Actual: " << actual_w << "x" << actual_h << "\n";
+
+    /* Ring buffer */
+    RingBuffer ring_buffer(ring_buffer_frames);
+
+    /* Recording state */
+    cv::VideoWriter writer;
+    std::string current_file;
+    time_t file_start = 0;
+    long split_seconds = (long)split_minutes * 60;
+    int total_files = 0;
+    long total_frames = 0;
+    time_t last_cleanup_check = 0;
+
+    cv::Mat frame, preview;
+    std::string window_name = "Recorder (press 'q' to stop)";
+    if (!headless) {
+        cv::namedWindow(window_name, cv::WINDOW_AUTOSIZE);
+    }
+
+    check_and_cleanup(output_dir);
+    std::cout << "[INFO] Recording started!\n\n";
+
+    while (running) {
+        if (!cap.read(frame) || frame.empty()) {
+            std::cerr << "[WARN] Empty frame\n";
+            continue;
+        }
+
+        cv::flip(frame, frame, 1);
+        time_t now = time(NULL);
+
+        /* ── Send frame to Python via ZMQ ─────────────── */
+        {
+            cv::Mat small_frame;
+            cv::resize(frame, small_frame,
+                       cv::Size(FRAME_SEND_WIDTH, FRAME_SEND_HEIGHT));
+            std::vector<uchar> buf;
+            cv::imencode(".jpg", small_frame, buf);
+
+            int32_t sw = FRAME_SEND_WIDTH;
+            int32_t sh = FRAME_SEND_HEIGHT;
+            size_t total = 8 + buf.size();
+            zmq::message_t zmsg(total);
+            char *ptr = (char*)zmsg.data();
+            memcpy(ptr, &sw, 4);
+            memcpy(ptr + 4, &sh, 4);
+            memcpy(ptr + 8, buf.data(), buf.size());
+            frame_pub.send(zmsg, ZMQ_DONTWAIT);
+        }
+
+        /* ── Push to ring buffer ──────────────────────── */
+        ring_buffer.push(frame, now);
+
+        /* ── Capture post-alert frames if recording ───── */
+        if (alert_recording) {
+            std::lock_guard<std::mutex> lock(post_frames_mtx);
+            BufferedFrame bf;
+            std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
+            cv::imencode(".jpg", frame, bf.jpeg_data, params);
+            bf.timestamp = now;
+            post_frames.push_back(std::move(bf));
+            int rem = post_alert_countdown.fetch_sub(1);
+            if (rem <= 1) {
+                alert_recording = false;
+                std::cout << "[ALERT] Post-alert complete.\n";
+            }
+        }
+
+        /* ── Handle alert trigger ─────────────────────── */
+        if (alert_triggered && !alert_saving && !alert_recording) {
+            alert_triggered = false;
+            alert_saving = true;
+            alert_recording = true;
+            post_alert_countdown = post_alert_frames;
+
+            { std::lock_guard<std::mutex> lock(post_frames_mtx);
+              post_frames.clear(); }
+
+            std::string atype;
+            { std::lock_guard<std::mutex> lock(alert_type_mtx);
+              atype = alert_type_received; }
+
+            auto pre = ring_buffer.snapshot();
+            int fw = frame.cols, fh = frame.rows;
+
+            std::thread(save_alert_clip, atype, std::move(pre), fw, fh, video_fps).detach();
+
+            std::cout << "[ALERT] Triggered! Saving "
+                      << RING_BUFFER_SECS << "s + "
+                      << POST_ALERT_SECS << "s clip.\n";
+        }
+
+        /* ── Normal recording with file splitting ─────── */
+        if (!writer.isOpened() || (now - file_start) >= split_seconds) {
+            if (writer.isOpened()) {
+                writer.release();
+                std::cout << "[INFO] Complete: " << current_file << "\n";
+            }
+            check_and_cleanup(output_dir);
+            current_file = generate_filename(output_dir, "rec_");
+            std::cout << "[INFO] New file: " << current_file << "\n";
+
+            int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+            writer.open(current_file, fourcc, video_fps,
+                        cv::Size(frame.cols, frame.rows));
+            if (!writer.isOpened()) {
+                fourcc = cv::VideoWriter::fourcc('X', 'V', 'I', 'D');
+                writer.open(current_file, fourcc, video_fps,
+                            cv::Size(frame.cols, frame.rows));
+            }
+            if (!writer.isOpened()) {
+                std::cerr << "[ERROR] Cannot create writer!\n";
+                break;
+            }
+            file_start = now;
+            total_files++;
+        }
+
+        writer.write(frame);
+        total_frames++;
+
+        /* ── Preview (skip in headless to avoid needing a display) ── */
+        if (!headless) {
+            cv::resize(frame, preview, cv::Size(PREVIEW_WIDTH, PREVIEW_HEIGHT));
+            cv::imshow(window_name, preview);
+            int key = cv::waitKey(1) & 0xFF;
+            if (key == 'q' || key == 'Q') {
+                std::cout << "\n[INFO] 'q' pressed.\n";
+                running = false;
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (now - last_cleanup_check >= CLEANUP_CHECK_SECS) {
+            check_and_cleanup(output_dir);
+            last_cleanup_check = now;
+        }
+    }
+
+    std::cout << "\n[INFO] Finishing...\n";
+    if (writer.isOpened()) writer.release();
+    cap.release();
+    frame_pub.close();
+    frame_ctx.close();
+    if (!headless) cv::destroyAllWindows();
+    std::cout << "[INFO] Files: " << total_files
+              << ", Frames: " << total_frames << "\n";
+
+    return 0;
+}
